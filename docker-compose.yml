@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: follower
+      POSTGRES_PASSWORD: follower
+      POSTGRES_DB: voi_follower
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U follower -d voi_follower"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  follower:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VOI_ALGOD_URL: ${VOI_ALGOD_URL:-https://mainnet-api.voi.nodely.dev}
+      VOI_ALGOD_TOKEN: ${VOI_ALGOD_TOKEN:-}
+      VOI_START_ROUND: ${VOI_START_ROUND:-latest}
+      VOI_SYNC_MODE: ${VOI_SYNC_MODE:-fast}
+      DATABASE_URL: postgres://follower:follower@postgres:5432/voi_follower?sslmode=disable
+      POLL_INTERVAL: ${POLL_INTERVAL:-100ms}
+      PREFETCH_WORKERS: ${PREFETCH_WORKERS:-16}
+      METRICS_ADDR: ":9090"
+      MIGRATIONS_PATH: /app/migrations
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # Optional local Voi follower node for Conduit-style testing.
+  # Uncomment and point VOI_ALGOD_URL at http://voi-node:8080.
+  #
+  # voi-node:
+  #   image: ghcr.io/voinetwork/voi-node:latest
+  #   environment:
+  #     VOINETWORK_NETWORK: mainnet
+  #     VOINETWORK_PROFILE: conduit
+  #     VOINETWORK_CATCHUP: "0"
+  #   volumes:
+  #     - voi-algod-data:/algod/data
+  #   restart: unless-stopped
+
+volumes:
+  postgres-data:
+  # voi-algod-data:

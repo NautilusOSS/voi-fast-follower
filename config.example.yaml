@@ -1,0 +1,19 @@
+network: voi-mainnet
+
+node:
+  algod_url: https://mainnet-api.voi.nodely.dev
+  algod_token: ""
+
+sync:
+  # "latest" or an explicit round number
+  start_round: latest
+  mode: fast
+  poll_interval: 100ms
+  prefetch_workers: 16
+  prefetch_buffer: 32
+
+database:
+  url: postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
+
+metrics:
+  addr: ":9090"

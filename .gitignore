@@ -1,0 +1,9 @@
+/bin/
+/tmp/
+*.exe
+*.test
+/config.yaml
+.env
+.DS_Store
+/voi-fast-follower
+/follower

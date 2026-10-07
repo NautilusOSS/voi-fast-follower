@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voi Fast Follower · Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg0: #0c1210;
+      --bg1: #121a17;
+      --bg2: #1a2420;
+      --line: #2a3a32;
+      --text: #e8f0ea;
+      --muted: #8aa396;
+      --accent: #c8f531;
+      --accent-dim: #8aad1f;
+      --pay: #7dd3fc;
+      --appl: #fbbf24;
+      --other: #c4b5fd;
+      --danger: #fb7185;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1a2e22 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #243018 0%, transparent 50%),
+        var(--bg0);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem 1.5rem;
+      align-items: end;
+      justify-content: space-between;
+      padding: 1.5rem 1.5rem 1rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      font-family: Syne, system-ui, sans-serif;
+      font-weight: 800;
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+      letter-spacing: -0.03em;
+      line-height: 1;
+      margin: 0;
+    }
+    .brand span { color: var(--accent); }
+    .sub { color: var(--muted); margin: 0.35rem 0 0; font-size: 12px; }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.25rem;
+      font-size: 12px;
+    }
+    .stat strong {
+      display: block;
+      font-family: Syne, system-ui, sans-serif;
+      font-size: 1.15rem;
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .stat span { color: var(--muted); }
+    .pulse {
+      width: 0.55rem; height: 0.55rem; border-radius: 50%;
+      background: var(--accent); display: inline-block;
+      box-shadow: 0 0 0 0 rgba(200, 245, 49, 0.6);
+      animation: pulse 2s infinite;
+      margin-right: 0.35rem; vertical-align: middle;
+    }
+    @keyframes pulse {
+      70% { box-shadow: 0 0 0 8px rgba(200, 245, 49, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(200, 245, 49, 0); }
+    }
+    main {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 1rem;
+      padding: 1rem 1.5rem 2rem;
+    }
+    @media (max-width: 960px) {
+      main { grid-template-columns: 1fr; }
+    }
+    section {
+      background: color-mix(in srgb, var(--bg1) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    section h2 {
+      font-family: Syne, system-ui, sans-serif;
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin: 0;
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--line);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .panel { max-height: 22rem; overflow: auto; }
+    .panel.tall { max-height: 28rem; }
+    .left-stack { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left;
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 500; font-size: 11px; position: sticky; top: 0; background: var(--bg2); }
+    tr { cursor: pointer; }
+    tr:hover td { background: rgba(200, 245, 49, 0.05); }
+    tr.active td { background: rgba(200, 245, 49, 0.1); }
+    .mono { font-variant-ligatures: none; }
+    .trunc { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
+    .badge {
+      display: inline-block;
+      padding: 0.1rem 0.4rem;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .badge.pay { color: var(--pay); }
+    .badge.appl { color: var(--appl); }
+    .badge.other { color: var(--other); }
+    .detail {
+      grid-column: 1 / -1;
+      padding: 1rem;
+    }
+    .detail.empty { color: var(--muted); }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+      gap: 0.75rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .kv label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 0.15rem; }
+    .kv div { word-break: break-all; }
+    .stack { display: flex; flex-direction: column; gap: 1rem; }
+    .err { color: var(--danger); padding: 1rem; }
+    footer {
+      padding: 0 1.5rem 1.5rem;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .busy { color: var(--accent); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 class="brand">Voi <span>Fast Follower</span></h1>
+      <p class="sub"><span class="pulse"></span>Local explorer · raw blocks from your follower DB · auto-refresh 2s</p>
+    </div>
+    <div class="stats" id="stats">
+      <div class="stat"><strong>—</strong><span>last round</span></div>
+      <div class="stat"><strong>—</strong><span>blocks</span></div>
+      <div class="stat"><strong>—</strong><span>txs</span></div>
+      <div class="stat"><strong>—</strong><span>senders</span></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="left-stack">
+      <section>
+        <h2>Recent blocks</h2>
+        <div class="panel" id="blocksPanel"></div>
+      </section>
+      <section>
+        <h2>Recent transactions</h2>
+        <div class="panel tall" id="txsPanel"></div>
+      </section>
+    </div>
+    <div class="stack">
+      <section>
+        <h2>Apps</h2>
+        <div class="panel" id="appsPanel"></div>
+      </section>
+      <section>
+        <h2>Most active senders</h2>
+        <div class="panel" id="sendersPanel"></div>
+      </section>
+      <section>
+        <h2>Busy blocks</h2>
+        <div class="panel" id="busyPanel"></div>
+      </section>
+    </div>
+    <section class="detail empty" id="detail">
+      Select a block, app, or sender to inspect transactions.
+    </section>
+  </main>
+
+  <footer>
+    API: <code>/api/status</code> · <code>/api/blocks</code> · <code>/api/apps</code> · <code>/api/transactions</code> ·
+    data is whatever this Fast Follower has ingested (not full-chain history).
+  </footer>
+
+  <script>
+    const API = (window.VOI_FOLLOWER_API || "").replace(/\/$/, "") || "";
+
+    const $ = (id) => document.getElementById(id);
+    let selectedRound = null;
+    let selectedSender = null;
+    let selectedApp = null;
+
+    async function get(path) {
+      const res = await fetch(API + path);
+      if (!res.ok) throw new Error(path + " → " + res.status);
+      return res.json();
+    }
+
+    function short(s, n = 10) {
+      if (!s) return "";
+      if (s.length <= n * 2 + 1) return s;
+      return s.slice(0, n) + "…" + s.slice(-n);
+    }
+
+    function typeBadge(t) {
+      const cls = t === "pay" ? "pay" : t === "appl" ? "appl" : "other";
+      return `<span class="badge ${cls}">${t || "?"}</span>`;
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return "—";
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString();
+    }
+
+    function renderStats(st) {
+      $("stats").innerHTML = `
+        <div class="stat"><strong>${st.last_processed_round || 0}</strong><span>last round</span></div>
+        <div class="stat"><strong>${st.block_count || 0}</strong><span>blocks stored</span></div>
+        <div class="stat"><strong>${st.tx_count || 0}</strong><span>transactions</span></div>
+        <div class="stat"><strong>${st.unique_senders || 0}</strong><span>unique senders</span></div>
+      `;
+    }
+
+    function renderBlocks(blocks) {
+      const rows = (blocks || []).map((b) => `
+        <tr data-round="${b.round}" class="${selectedRound === b.round ? "active" : ""}">
+          <td>${b.round}</td>
+          <td class="${b.txn_count > 0 ? "busy" : ""}">${b.txn_count}</td>
+          <td class="mono trunc" title="${b.block_hash}">${short(b.block_hash, 8)}</td>
+          <td>${fmtTime(b.timestamp)}</td>
+        </tr>`).join("");
+      $("blocksPanel").innerHTML = `
+        <table>
+          <thead><tr><th>Round</th><th>Txs</th><th>Hash</th><th>Time</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="4">No blocks yet</td></tr>`}</tbody>
+        </table>`;
+      $("blocksPanel").querySelectorAll("tr[data-round]").forEach((tr) => {
+        tr.addEventListener("click", () => openBlock(Number(tr.dataset.round)));
+      });
+    }
+
+    function renderRecentTxs(txs) {
+      const rows = (txs || []).map((t) => `
+        <tr data-round="${t.round}">
+          <td>${t.round}</td>
+          <td>${typeBadge(t.type)}</td>
+          <td>${t.app_id ? `<a href="#" data-app="${t.app_id}" class="busy">${t.app_id}</a>` : "—"}</td>
+          <td class="mono trunc" title="${t.txid}">${short(t.txid, 6)}</td>
+          <td class="mono trunc" title="${t.sender}"><a href="#" data-sender="${t.sender}">${short(t.sender, 4)}</a></td>
+        </tr>`).join("");
+      $("txsPanel").innerHTML = `
+        <table>
+          <thead><tr><th>Round</th><th>Type</th><th>App</th><th>TxID</th><th>Sender</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5">No transactions yet</td></tr>`}</tbody>
+        </table>`;
+      $("txsPanel").querySelectorAll("tr[data-round]").forEach((tr) => {
+        tr.addEventListener("click", (e) => {
+          if (e.target.closest("a")) return;
+          openBlock(Number(tr.dataset.round));
+        });
+      });
+      bindDetailLinks($("txsPanel"));
+    }
+
+    function renderApps(apps) {
+      const rows = (apps || []).map((a, i) => `
+        <tr data-app="${a.app_id}" class="${selectedApp === a.app_id ? "active" : ""}">
+          <td>${i + 1}</td>
+          <td class="mono busy">${a.app_id}</td>
+          <td class="busy">${a.call_count}</td>
+          <td>${a.unique_senders}</td>
+          <td>${a.last_round}</td>
+        </tr>`).join("");
+      $("appsPanel").innerHTML = `
+        <table>
+          <thead><tr><th>#</th><th>App ID</th><th>Calls</th><th>Senders</th><th>Last</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5">No app calls yet</td></tr>`}</tbody>
+        </table>`;
+      $("appsPanel").querySelectorAll("tr[data-app]").forEach((tr) => {
+        tr.addEventListener("click", () => openApp(Number(tr.dataset.app)));
+      });
+    }
+
+    function fmtVOI(s) {
+      if (!s || !s.balance_known) return "—";
+      const v = Number(s.balance_voi);
+      if (!Number.isFinite(v)) return "—";
+      if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 1 });
+      if (v >= 1) return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+      return v.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    }
+
+    function renderSenders(senders) {
+      const rows = (senders || []).map((s, i) => `
+        <tr data-sender="${s.sender}">
+          <td>${i + 1}</td>
+          <td class="mono trunc" title="${s.sender}">${short(s.sender, 6)}</td>
+          <td class="busy" title="${s.balance_known ? s.balance_micro + ' µVOI' : 'balance unavailable'}">${fmtVOI(s)}</td>
+          <td class="busy">${s.tx_count}</td>
+          <td>${s.rounds_active}</td>
+        </tr>`).join("");
+      $("sendersPanel").innerHTML = `
+        <table>
+          <thead><tr><th>#</th><th>Sender</th><th>Bal VOI</th><th>Txs</th><th>Rounds</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5">No txs yet</td></tr>`}</tbody>
+        </table>`;
+      $("sendersPanel").querySelectorAll("tr[data-sender]").forEach((tr) => {
+        tr.addEventListener("click", () => openSender(tr.dataset.sender));
+      });
+    }
+
+    function renderBusy(blocks) {
+      const rows = (blocks || []).map((b) => `
+        <tr data-round="${b.round}">
+          <td>${b.round}</td>
+          <td class="busy">${b.txn_count}</td>
+          <td class="mono trunc" title="${b.block_hash}">${short(b.block_hash, 6)}</td>
+        </tr>`).join("");
+      $("busyPanel").innerHTML = `
+        <table>
+          <thead><tr><th>Round</th><th>Txs</th><th>Hash</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="3">Quiet chain so far</td></tr>`}</tbody>
+        </table>`;
+      $("busyPanel").querySelectorAll("tr[data-round]").forEach((tr) => {
+        tr.addEventListener("click", () => openBlock(Number(tr.dataset.round)));
+      });
+    }
+
+    function renderTxTable(txs) {
+      if (!txs || !txs.length) return `<p class="empty">No transactions in this selection.</p>`;
+      return `
+        <table>
+          <thead><tr><th>Round</th><th>Type</th><th>App</th><th>TxID</th><th>Sender</th></tr></thead>
+          <tbody>
+            ${txs.map((t) => `
+              <tr>
+                <td><a href="#" data-round="${t.round}">${t.round}</a></td>
+                <td>${typeBadge(t.type)}</td>
+                <td>${t.app_id ? `<a href="#" data-app="${t.app_id}" class="busy">${t.app_id}</a>` : "—"}</td>
+                <td class="mono trunc" title="${t.txid}">${t.txid}</td>
+                <td class="mono trunc" title="${t.sender}"><a href="#" data-sender="${t.sender}">${short(t.sender, 6)}</a></td>
+              </tr>`).join("")}
+          </tbody>
+        </table>`;
+    }
+
+    async function openBlock(round) {
+      selectedRound = round;
+      selectedSender = null;
+      selectedApp = null;
+      const data = await get(`/api/blocks/${round}`);
+      const b = data.block;
+      const el = $("detail");
+      el.classList.remove("empty");
+      el.innerHTML = `
+        <h2 style="margin:0 0 0.75rem;font-family:Syne,sans-serif;">Block ${b.round}</h2>
+        <div class="detail-grid">
+          <div class="kv"><label>Block hash</label><div class="mono">${b.block_hash}</div></div>
+          <div class="kv"><label>Previous</label><div class="mono">${b.previous_block_hash}</div></div>
+          <div class="kv"><label>Txn count</label><div>${b.txn_count}</div></div>
+          <div class="kv"><label>Block time</label><div>${new Date(b.timestamp * 1000).toLocaleString()}</div></div>
+        </div>
+        ${renderTxTable(data.transactions)}`;
+      bindDetailLinks(el);
+      renderBlocks(window.__blocks || []);
+      renderApps(window.__apps || []);
+    }
+
+    async function openSender(sender) {
+      selectedSender = sender;
+      selectedRound = null;
+      selectedApp = null;
+      const [data, sendersResp] = await Promise.all([
+        get(`/api/transactions?limit=50&sender=${encodeURIComponent(sender)}`),
+        get(`/api/senders?limit=25`),
+      ]);
+      const info = (sendersResp.senders || []).find((s) => s.sender === sender);
+      const bal = info && info.balance_known
+        ? `${fmtVOI(info)} VOI <span style="color:var(--muted)">(${Number(info.balance_micro).toLocaleString()} µVOI)</span>`
+        : "—";
+      const el = $("detail");
+      el.classList.remove("empty");
+      el.innerHTML = `
+        <h2 style="margin:0 0 0.75rem;font-family:Syne,sans-serif;">Sender</h2>
+        <div class="detail-grid" style="margin-bottom:1rem">
+          <div class="kv"><label>Address</label><div class="mono">${sender}</div></div>
+          <div class="kv"><label>Balance</label><div class="busy">${bal}</div></div>
+          <div class="kv"><label>Explorer</label><div><a href="https://explorer.voi.network/explorer/account/${sender}" target="_blank" rel="noopener">voi explorer ↗</a></div></div>
+        </div>
+        ${renderTxTable(data.transactions)}`;
+      bindDetailLinks(el);
+      renderApps(window.__apps || []);
+    }
+
+    async function openApp(appId) {
+      selectedApp = appId;
+      selectedRound = null;
+      selectedSender = null;
+      const data = await get(`/api/transactions?limit=50&app_id=${appId}`);
+      const el = $("detail");
+      el.classList.remove("empty");
+      el.innerHTML = `
+        <h2 style="margin:0 0 0.75rem;font-family:Syne,sans-serif;">App ${appId}</h2>
+        <div class="detail-grid" style="margin-bottom:1rem">
+          <div class="kv"><label>Application ID</label><div class="mono busy">${appId}</div></div>
+          <div class="kv"><label>Explorer</label><div><a href="https://explorer.voi.network/explorer/application/${appId}" target="_blank" rel="noopener">voi explorer ↗</a></div></div>
+          <div class="kv"><label>Calls in follower DB</label><div>${(data.transactions || []).length}${ (data.transactions || []).length >= 50 ? "+" : "" }</div></div>
+        </div>
+        ${renderTxTable(data.transactions)}`;
+      bindDetailLinks(el);
+      renderApps(window.__apps || []);
+    }
+
+    function bindDetailLinks(root) {
+      root.querySelectorAll("[data-round]").forEach((a) => {
+        a.addEventListener("click", (e) => { e.preventDefault(); openBlock(Number(a.dataset.round)); });
+      });
+      root.querySelectorAll("[data-sender]").forEach((a) => {
+        a.addEventListener("click", (e) => { e.preventDefault(); openSender(a.dataset.sender); });
+      });
+      root.querySelectorAll("[data-app]").forEach((a) => {
+        a.addEventListener("click", (e) => { e.preventDefault(); openApp(Number(a.dataset.app)); });
+      });
+    }
+
+    async function refresh() {
+      try {
+        const [st, blocks, txs, apps, senders, busy] = await Promise.all([
+          get("/api/status"),
+          get("/api/blocks?limit=40"),
+          get("/api/transactions?limit=40"),
+          get("/api/apps?limit=10"),
+          get("/api/senders?limit=10"),
+          get("/api/busy-blocks?limit=8"),
+        ]);
+        window.__blocks = blocks.blocks;
+        window.__apps = apps.apps;
+        renderStats(st);
+        renderBlocks(blocks.blocks);
+        renderRecentTxs(txs.transactions);
+        renderApps(apps.apps);
+        renderSenders(senders.senders);
+        renderBusy(busy.blocks);
+      } catch (err) {
+        $("blocksPanel").innerHTML = `<div class="err">API error: ${err.message}. Is the follower running on :9090?</div>`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

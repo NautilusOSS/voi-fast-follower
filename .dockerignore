@@ -1,0 +1,10 @@
+.git
+.cursor
+*.md
+/bin
+/tmp
+config.yaml
+.env
+**/*_test.go
+scripts/
+tests/
