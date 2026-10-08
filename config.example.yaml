@@ -9,11 +9,16 @@ sync:
   start_round: latest
   mode: fast
   poll_interval: 100ms
-  prefetch_workers: 16
-  prefetch_buffer: 32
+  workers: 32
+  fetch_window: 128
+  commit_batch_size: 50
+  commit_flush_interval: 200ms
 
 database:
   url: postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
 
 metrics:
   addr: ":9090"
+
+log:
+  level: info

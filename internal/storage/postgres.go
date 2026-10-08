@@ -85,52 +85,141 @@ func loadMigrationSQL(migrationsPath string) ([]string, error) {
 	return out, nil
 }
 
-// ProcessBlock inserts the block and transactions, then advances the checkpoint
-// in a single transaction.
-func (s *PostgresBlockSink) ProcessBlock(ctx context.Context, blk block.Block) error {
+// Commit persists a single block. Equivalent to CommitBatch of one element.
+func (s *PostgresBlockSink) Commit(ctx context.Context, blk block.Block) error {
+	return s.CommitBatch(ctx, []block.Block{blk})
+}
+
+// CommitBatch inserts all blocks and their transactions, then advances the
+// checkpoint to the final round, in one PostgreSQL transaction.
+//
+// Uses array UNNEST inserts (few round-trips) instead of per-row Exec.
+// Inserts are idempotent (ON CONFLICT DO NOTHING). On any error the
+// transaction rolls back and the checkpoint is unchanged.
+func (s *PostgresBlockSink) CommitBatch(ctx context.Context, blocks []block.Block) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	if err := ValidateBatch(blocks); err != nil {
+		return err
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO blocks (round, block_hash, previous_block_hash, timestamp, txn_count, raw_block)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (round) DO NOTHING
-	`, blk.Round, blk.BlockHash, blk.PreviousBlockHash, blk.Timestamp, blk.TxnCount, blk.Raw)
-	if err != nil {
-		return fmt.Errorf("insert block %d: %w", blk.Round, err)
+	if err := insertBlocks(ctx, tx, blocks); err != nil {
+		return err
+	}
+	if err := insertTransactions(ctx, tx, blocks); err != nil {
+		return err
 	}
 
-	for _, txn := range blk.Transactions {
-		var appID any
-		if txn.AppID > 0 {
-			appID = int64(txn.AppID)
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO transactions (round, txid, sender, type, app_id, raw_transaction)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (txid) DO NOTHING
-		`, blk.Round, txn.TxID, txn.Sender, txn.Type, appID, txn.Raw)
-		if err != nil {
-			return fmt.Errorf("insert tx %s round %d: %w", txn.TxID, blk.Round, err)
-		}
-	}
-
+	final := blocks[len(blocks)-1].Round
 	_, err = tx.Exec(ctx, `
 		INSERT INTO sync_state (key, value)
 		VALUES ($1, $2)
 		ON CONFLICT (key) DO UPDATE
 		SET value = EXCLUDED.value
 		WHERE sync_state.value < EXCLUDED.value
-	`, checkpointKey, int64(blk.Round))
+	`, checkpointKey, int64(final))
 	if err != nil {
 		return fmt.Errorf("update checkpoint: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit block %d: %w", blk.Round, err)
+		return fmt.Errorf("commit batch %d-%d: %w", blocks[0].Round, final, err)
+	}
+	return nil
+}
+
+func insertBlocks(ctx context.Context, tx pgx.Tx, blocks []block.Block) error {
+	n := len(blocks)
+	rounds := make([]int64, n)
+	hashes := make([]string, n)
+	prevs := make([]string, n)
+	timestamps := make([]int64, n)
+	txnCounts := make([]int32, n)
+	raws := make([][]byte, n)
+	for i, blk := range blocks {
+		rounds[i] = int64(blk.Round)
+		hashes[i] = blk.BlockHash
+		prevs[i] = blk.PreviousBlockHash
+		timestamps[i] = blk.Timestamp
+		txnCounts[i] = int32(blk.TxnCount)
+		raws[i] = blk.Raw
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO blocks (round, block_hash, previous_block_hash, timestamp, txn_count, raw_block)
+		SELECT * FROM UNNEST(
+			$1::bigint[],
+			$2::text[],
+			$3::text[],
+			$4::bigint[],
+			$5::int[],
+			$6::bytea[]
+		) AS t(round, block_hash, previous_block_hash, timestamp, txn_count, raw_block)
+		ON CONFLICT (round) DO NOTHING
+	`, rounds, hashes, prevs, timestamps, txnCounts, raws)
+	if err != nil {
+		return fmt.Errorf("insert blocks %d-%d: %w", blocks[0].Round, blocks[n-1].Round, err)
+	}
+	return nil
+}
+
+func insertTransactions(ctx context.Context, tx pgx.Tx, blocks []block.Block) error {
+	total := 0
+	for _, blk := range blocks {
+		total += len(blk.Transactions)
+	}
+	if total == 0 {
+		return nil
+	}
+
+	rounds := make([]int64, 0, total)
+	txids := make([]string, 0, total)
+	senders := make([]string, 0, total)
+	types := make([]string, 0, total)
+	appIDs := make([]int64, 0, total)
+	raws := make([][]byte, 0, total)
+
+	for _, blk := range blocks {
+		for _, txn := range blk.Transactions {
+			rounds = append(rounds, int64(blk.Round))
+			txids = append(txids, txn.TxID)
+			senders = append(senders, txn.Sender)
+			types = append(types, txn.Type)
+			appIDs = append(appIDs, int64(txn.AppID))
+			raws = append(raws, txn.Raw)
+		}
+	}
+
+	// app_id 0 is stored as NULL to match prior single-row behavior.
+	_, err := tx.Exec(ctx, `
+		INSERT INTO transactions (round, txid, sender, type, app_id, raw_transaction)
+		SELECT
+			t.round,
+			t.txid,
+			t.sender,
+			t.type,
+			NULLIF(t.app_id, 0),
+			t.raw_transaction
+		FROM UNNEST(
+			$1::bigint[],
+			$2::text[],
+			$3::text[],
+			$4::text[],
+			$5::bigint[],
+			$6::bytea[]
+		) AS t(round, txid, sender, type, app_id, raw_transaction)
+		ON CONFLICT (txid) DO NOTHING
+	`, rounds, txids, senders, types, appIDs, raws)
+	if err != nil {
+		return fmt.Errorf("insert transactions for blocks %d-%d: %w",
+			blocks[0].Round, blocks[len(blocks)-1].Round, err)
 	}
 	return nil
 }
@@ -200,7 +289,6 @@ func (s *PostgresBlockSink) backfillAppIDs(ctx context.Context) error {
 		WHERE type = 'appl' AND (app_id IS NULL OR app_id = 0)
 	`)
 	if err != nil {
-		// Column may not exist yet on very old DBs mid-migrate; ignore.
 		if strings.Contains(err.Error(), "app_id") {
 			return nil
 		}

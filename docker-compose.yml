@@ -24,10 +24,15 @@ services:
       VOI_ALGOD_URL: ${VOI_ALGOD_URL:-https://mainnet-api.voi.nodely.dev}
       VOI_ALGOD_TOKEN: ${VOI_ALGOD_TOKEN:-}
       VOI_START_ROUND: ${VOI_START_ROUND:-latest}
+      START_ROUND: ${START_ROUND:-}
       VOI_SYNC_MODE: ${VOI_SYNC_MODE:-fast}
       DATABASE_URL: postgres://follower:follower@postgres:5432/voi_follower?sslmode=disable
       POLL_INTERVAL: ${POLL_INTERVAL:-100ms}
-      PREFETCH_WORKERS: ${PREFETCH_WORKERS:-16}
+      WORKERS: ${WORKERS:-32}
+      FETCH_WINDOW: ${FETCH_WINDOW:-128}
+      COMMIT_BATCH_SIZE: ${COMMIT_BATCH_SIZE:-50}
+      COMMIT_FLUSH_INTERVAL: ${COMMIT_FLUSH_INTERVAL:-200ms}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       METRICS_ADDR: ":9090"
       MIGRATIONS_PATH: /app/migrations
     ports:

@@ -10,21 +10,37 @@ This is **not** an indexer. Raw blocks/transactions are persisted; application d
 Voi Network (algod)
         │
         ▼
- Voi Fast Follower  ──► PostgreSQL (PostgresBlockSink)
+ concurrent BlockRaw fetches  (worker pool)
         │
-        └── BlockSink interface (future: Kafka, NATS, Conduit, …)
+        ▼
+ ordered commit               (gap-free)
+        │
+        ▼
+ durable checkpoint           (last_processed_round)
+        │
+        ▼
+ PostgresBlockSink  ←── BlockSink interface (future: Kafka, NATS, Conduit, …)
 ```
 
 ## Features (Phase 1)
 
-- Configurable algod URL/token (no hard-coded endpoints)
-- `start_round: latest` or an explicit round
-- Sequential, gap-free ingestion with concurrent prefetch
-- Durable checkpoint (`last_processed_round`) committed with each block
+- Configurable algod URL/token (no hard-coded endpoints; no node internals)
+- `GetBlock` / `WaitForBlockAfter` over standard algod v2 msgpack `BlockRaw`
+- Concurrent fetch worker pool (default **32**) with bounded `FETCH_WINDOW`
+- Strictly ordered commits; out-of-order fetches are buffered until the gap fills
+- **Batched catch-up commits** (`COMMIT_BATCH_SIZE`, default **50**) via `BatchBlockSink`
+- Live follow forces batch size **1** for low latency
+- Durable checkpoint advanced atomically with each (batch) commit
 - Idempotent writes (`ON CONFLICT DO NOTHING`)
-- Node outage retry with exponential backoff
+- Live follow via `wait-for-block-after` using the same commit path
 - Prometheus metrics on `:9090/metrics`
 - Docker Compose: `follower` + `postgres`
+
+### Correctness invariant
+
+> Every committed round is contiguous, and the checkpoint always represents a fully committed round.
+
+Never advance `last_processed_round` past a missing round. On restart: `resume_round = last_processed_round + 1`.
 
 ## Quick start
 
@@ -37,51 +53,41 @@ export VOI_START_ROUND=$(($(curl -fsS https://mainnet-api.voi.nodely.dev/v2/stat
 docker compose up --build
 ```
 
-Environment variables:
-
 | Variable | Description |
 |---|---|
-| `VOI_ALGOD_URL` | Algod base URL (example: `https://mainnet-api.voi.nodely.dev`) |
+| `VOI_ALGOD_URL` | Algod base URL |
 | `VOI_ALGOD_TOKEN` | API token if required |
-| `VOI_START_ROUND` | `latest` or integer round |
-| `VOI_SYNC_MODE` | `fast` (concurrent prefetch) |
+| `VOI_START_ROUND` / `START_ROUND` | `latest` or integer round |
+| `WORKERS` | Concurrent fetch workers (default 32) |
+| `FETCH_WINDOW` | Max in-flight rounds (raised to ≥ batch size) |
+| `COMMIT_BATCH_SIZE` | Contiguous blocks per catch-up commit (default 50) |
+| `COMMIT_FLUSH_INTERVAL` | Partial-batch flush while catching up (default 200ms) |
 | `DATABASE_URL` | Postgres DSN |
-| `POLL_INTERVAL` | Fallback poll when waiting at tip |
-| `PREFETCH_WORKERS` | Concurrent block fetch workers (default 16) |
+| `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `METRICS_ADDR` | Metrics listen address (default `:9090`) |
 
-See [config.example.yaml](config.example.yaml).
+See [config.example.yaml](config.example.yaml). Legacy `PREFETCH_WORKERS` / `PREFETCH_BUFFER` env vars still work.
 
 ### Local binary
 
 ```bash
-# Start Postgres (compose service only)
 docker compose up -d postgres
 
 export VOI_ALGOD_URL=https://mainnet-api.voi.nodely.dev
 export DATABASE_URL=postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
-export VOI_START_ROUND=latest   # or an explicit round for catch-up demos
+export VOI_START_ROUND=latest
 
 go run ./cmd/follower -config config.example.yaml -migrations migrations
 ```
 
-Metrics: `curl localhost:9090/metrics`  
-Health: `curl localhost:9090/healthz`  
-Explorer UI: [http://localhost:9090/](http://localhost:9090/) (read-only demo over ingested blocks)
-
 ## How it works
 
 1. **Checkpoint** – If `sync_state.last_processed_round` exists, resume at `N+1`. Otherwise use `start_round` (`latest` → current tip).
-2. **Prefetch** – Fetch a window of rounds concurrently (`PREFETCH_WORKERS`).
-3. **Ordered commit** – Persist block + txs + checkpoint in one Postgres transaction, in strict round order (never skip).
-4. **Live follow** – At tip, use `GET /v2/status/wait-for-block-after/{round}`; same ingestion path as catch-up.
-
-### Correctness guarantees
-
-- No silent round skips
-- At-least-once ingestion with idempotent inserts
-- Restart resumes from last safely committed round
-- Optional chain-link check: `previous_block_hash` vs stored prior `block_hash`
+2. **Worker pool** – Up to `WORKERS` goroutines fetch `BlockRaw` concurrently. The orchestrator never has more than `FETCH_WINDOW` rounds in-flight.
+3. **Ordered buffer** – Results may arrive out of order; they are held until the next expected round is present.
+4. **Batched commit (catch-up)** – Contiguous ready rounds are committed together via `CommitBatch` (one Postgres transaction, checkpoint = final round). Live mode uses batch size 1.
+5. **Validation** – Round match, non-empty block hash (BH over header), previous-block linkage against the last committed hash. Raw msgpack is preserved.
+6. **Live follow** – At tip, `WaitForBlockAfter`; same validation + commit path (batch size 1).
 
 ## Schema
 
@@ -95,56 +101,43 @@ See [migrations/001_initial.sql](migrations/001_initial.sql):
 
 | Metric | Meaning |
 |---|---|
-| `voi_follower_current_round` | Commit cursor |
+| `voi_follower_current_round` | Next commit cursor |
 | `voi_follower_target_round` | Network tip |
 | `voi_follower_catchup_lag` | `target - current` |
 | `voi_follower_last_processed_round` | Durable checkpoint |
 | `voi_follower_blocks_processed_total` | Counter |
 | `voi_follower_blocks_per_second` | Recent throughput |
+| `voi_follower_fetch_latency_seconds` | Fetch+decode histogram |
+| `voi_follower_commit_latency_seconds` | Commit histogram |
+| `voi_follower_workers_busy` / `_total` | Worker utilization |
+| `voi_follower_inflight_rounds` | Bounded window occupancy |
 | `voi_follower_errors_total` | Errors |
 
 ## Benchmark
 
 ```bash
-# Postgres must be up. RESET_DB=1 clears the range before the run.
 docker compose up -d postgres
 export DATABASE_URL=postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
-export VOI_START_ROUND=  # leave empty to default tip-500 in the script
-RESET_DB=1 ./scripts/bench.sh
+
+# Fetch-only + COMMIT_BATCH_SIZE sweep (1/10/50/100/500) over 1000 rounds
+COUNT=1000 WORKERS=32 MODE=both ./scripts/bench.sh
+
+# Single e2e run:
+go run ./cmd/bench -mode e2e -count 1000 -workers 32 -batch 50 -reset
 ```
 
-The script reports start/end round, elapsed time, average and peak blocks/sec. Capture CPU/RAM with `docker stats` or Activity Monitor during the run.
+Reports start/end round, elapsed time, blocks/sec, and commit latency (avg/p50/p95).
 
-## Research notes (Phase 1)
+### Phase 2 results (1000 mainnet rounds, 32 workers, durable `synchronous_commit`)
 
-| Topic | Conclusion |
-|---|---|
-| Authoritative node | [VoiNetwork/go-algorand](https://github.com/VoiNetwork/go-algorand) (`AVAIL` channel); Docker `ghcr.io/voinetwork/voi-node` |
-| SDK | [`github.com/algorand/go-algorand-sdk/v2`](https://github.com/algorand/go-algorand-sdk) — Voi speaks standard algod v2 |
-| Block API | `GET /v2/blocks/{round}?format=msgpack` (`BlockRaw`); no multi-round batch API |
-| Throughput | Concurrent prefetch + ordered commit is the practical win over sequential HTTP |
-| Follower node vs this app | Conduit needs follow-mode + state deltas. This PoC only needs `GetBlock` (works on public/archival APIs) |
-| Catchpoints | Bootstrap the **node**, not this follower process |
-| Mimir | Nautilus NFT Navigator indexer (`mainnet-idx.nautilus.sh`) — downstream consumer, not coupled here |
-| Conduit | Treat as a future **consumer**. Official Voi example: [voi-examples/indexer](https://github.com/VoiNetwork/voi-examples/tree/main/indexer) with `VOINETWORK_PROFILE=conduit` |
-
-Genesis ID observed on mainnet API: `voimain-v1.0`.
-
-## Project layout
-
-```text
-cmd/follower/main.go
-internal/config/
-internal/voi/
-internal/block/
-internal/follower/
-internal/storage/     # BlockSink + PostgresBlockSink
-internal/metrics/
-migrations/
-scripts/bench.sh
-Dockerfile
-docker-compose.yml
-```
+| Batch | Blocks/sec | Notes |
+|------:|-----------:|-------|
+| fetch-only | ~135 | Upper bound (no Postgres) |
+| 1 | ~41 | UNNEST single-block commit |
+| 10 | ~45 | |
+| **50** | **~45** | **Default — best practical** |
+| 100 | ~39 | Diminishing returns |
+| 500 | ~8 | Too large; fill/txn cost dominates |
 
 ## Tests
 
@@ -152,20 +145,42 @@ docker-compose.yml
 go test ./...
 
 # Live algod decode check
-VOI_INTEGRATION=1 go test ./internal/block -v
+VOI_INTEGRATION=1 go test ./internal/block ./internal/voi -v
 
 # Postgres idempotency (compose postgres up)
 DATABASE_URL=postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable \
   go test ./internal/storage -v
 ```
 
-## Future (not Phase 1)
+Follower unit tests cover sequential ingestion, out-of-order fetch, ordered commits, missing-round retry, duplicates, checkpoint restart, commit failure retry, chain linkage, worker concurrency, and bounded buffering.
 
-- Official follower snapshots (`voi-follower-snapshot-N`)
-- Additional `BlockSink` implementations (Kafka, NATS, object storage)
-- Optional co-located local-ledger read path
-- Conduit integration validation (consumer of this stream or of algod)
+## Project layout
 
-## Non-goals
+```text
+cmd/follower/main.go
+cmd/bench/main.go
+internal/config/
+internal/voi/          # GetBlock, WaitForBlockAfter
+internal/block/        # msgpack decode + hash
+internal/follower/     # worker pool + ordered commit
+internal/storage/      # BlockSink + PostgresBlockSink
+internal/metrics/
+migrations/
+scripts/bench.sh
+```
 
-Full explorer, REST/GraphQL API, ARC-200/72 indexers, DEX/NFT business logic, Supabase, consensus node, Conduit fork.
+## Research notes (Phase 1)
+
+| Topic | Conclusion |
+|---|---|
+| Authoritative node | [VoiNetwork/go-algorand](https://github.com/VoiNetwork/go-algorand) (`AVAIL` channel) |
+| SDK | [`github.com/algorand/go-algorand-sdk/v2`](https://github.com/algorand/go-algorand-sdk) — Voi speaks standard algod v2 |
+| Block API | `GET /v2/blocks/{round}?format=msgpack` (`BlockRaw`); no multi-round batch API |
+| Throughput | Concurrent prefetch + ordered commit beats sequential HTTP |
+| Catchpoints | Bootstrap the **node**, not this follower process |
+
+Genesis ID observed on mainnet API: `voimain-v1.0`.
+
+## Non-goals (Phase 1)
+
+ARC-200/72 decoding, DEX/NFT indexing, explorer APIs, GraphQL, Supabase, Kafka, direct ledger DB access, BlockService RPC, Conduit integration, snapshot generation.

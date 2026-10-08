@@ -9,7 +9,7 @@ import (
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
 )
 
-func TestPostgresIdempotentProcessBlock(t *testing.T) {
+func TestPostgresIdempotentCommit(t *testing.T) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		t.Skip("set DATABASE_URL to run postgres tests")
@@ -23,7 +23,7 @@ func TestPostgresIdempotentProcessBlock(t *testing.T) {
 	defer sink.Close()
 
 	// Use a disposable round far from tip, but never advance the real checkpoint
-	// past tip — ProcessBlock upserts sync_state. Save/restore around the test.
+	// past tip — Commit upserts sync_state. Save/restore around the test.
 	round := uint64(9_000_000_001)
 	txid := "TXTEST9000000001"
 	prevRound, prevOK, _ := sink.LastProcessedRound(ctx)
@@ -59,10 +59,10 @@ func TestPostgresIdempotentProcessBlock(t *testing.T) {
 		}},
 	}
 
-	if err := sink.ProcessBlock(ctx, blk); err != nil {
+	if err := sink.Commit(ctx, blk); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.ProcessBlock(ctx, blk); err != nil {
+	if err := sink.Commit(ctx, blk); err != nil {
 		t.Fatal(err)
 	}
 

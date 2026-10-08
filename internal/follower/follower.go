@@ -2,39 +2,70 @@ package follower
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/config"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/metrics"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/voi"
 )
 
-// Engine runs catch-up and live following with concurrent prefetch
-// and ordered sequential commits.
+// errUntilReached is returned internally when WithUntilRound is satisfied.
+var errUntilReached = errors.New("until round reached")
+
+// Engine runs catch-up and live following with concurrent prefetch and
+// ordered sequential (optionally batched) commits.
+//
+// Concurrency model:
+//
+//	orchestrator ──jobs──► workers ──results──► ordered buffer ──► BatchBlockSink
+//
+// Invariants:
+//   - At most FetchWindow rounds may be in-flight (dispatched but not committed).
+//   - Commits are strictly sequential / contiguous: never advance past a gap.
+//   - Out-of-order fetch completion is buffered until the next expected round arrives.
+//   - Catch-up may CommitBatch multiple contiguous rounds atomically.
+//   - Live follow uses batch size 1 for low latency.
+//   - every committed round is contiguous; the checkpoint always represents a
+//     fully committed round (the final round of the last successful batch).
 type Engine struct {
 	cfg     *config.Config
-	client  *voi.Client
-	sink    storage.BlockSink
+	src     BlockSource
+	sink    storage.BatchBlockSink
 	metrics *metrics.Metrics
 	log     *slog.Logger
+
+	// untilRound, when non-zero, stops the engine after that round is committed
+	// (used by benchmarks; production leaves this at 0 = follow forever).
+	untilRound uint64
 }
 
-// New creates a follower engine.
-func New(cfg *config.Config, client *voi.Client, sink storage.BlockSink, m *metrics.Metrics, log *slog.Logger) *Engine {
+// New creates a follower engine. src is typically *voi.Client.
+func New(cfg *config.Config, src BlockSource, sink storage.BlockSink, m *metrics.Metrics, log *slog.Logger) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
 	if m == nil {
 		m = metrics.Default()
 	}
-	return &Engine{cfg: cfg, client: client, sink: sink, metrics: m, log: log}
+	return &Engine{cfg: cfg, src: src, sink: storage.AsBatchSink(sink), metrics: m, log: log}
+}
+
+// WithUntilRound configures a finite catch-up that exits after committing round.
+func (e *Engine) WithUntilRound(round uint64) *Engine {
+	e.untilRound = round
+	return e
+}
+
+type fetchResult struct {
+	round   uint64
+	blk     block.Block
+	err     error
+	latency time.Duration
 }
 
 // Run blocks until ctx is cancelled or a fatal error occurs.
@@ -46,41 +77,49 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.log.Info("follower starting",
 		"next_round", next,
 		"mode", e.cfg.Sync.Mode,
-		"prefetch_workers", e.cfg.Sync.PrefetchWorkers,
+		"workers", e.cfg.Sync.Workers,
+		"fetch_window", e.cfg.Sync.FetchWindow,
+		"commit_batch_size", e.cfg.Sync.CommitBatchSize,
 		"network", e.cfg.Network,
 	)
 
-	tip, err := e.client.LastRound(ctx)
+	tip, err := e.src.LastRound(ctx)
 	if err != nil {
 		return fmt.Errorf("initial tip: %w", err)
 	}
-	if next > tip+1000 {
-		// Recover from a polluted checkpoint (e.g. leftover test row) by
-		// resuming from the highest real block at/under tip, or the tip.
-		if maxRound, ok, mErr := e.sink.MaxBlockRound(ctx); mErr == nil && ok {
-			if maxRound > tip {
-				// Ignore absurd stored rounds (test fixtures).
-				e.log.Warn("checkpoint ahead of tip; restarting from tip",
-					"checkpoint_next", next, "tip", tip, "max_stored", maxRound)
-				next = tip
-			} else {
-				e.log.Warn("checkpoint ahead of tip; recovering from max stored block",
-					"checkpoint_next", next, "tip", tip, "max_stored", maxRound)
-				next = maxRound + 1
-			}
-		} else {
-			e.log.Warn("checkpoint ahead of tip; restarting from tip",
-				"checkpoint_next", next, "tip", tip)
-			next = tip
-		}
-	}
+	next = e.recoverIfCheckpointAhead(ctx, next, tip)
+
 	last := uint64(0)
 	if next > 0 {
 		last = next - 1
 	}
 	e.metrics.SetRounds(next, tip, last)
+	e.metrics.SetWorkersTotal(e.cfg.Sync.Workers)
 
-	return e.loop(ctx, next)
+	err = e.loop(ctx, next)
+	if errors.Is(err, errUntilReached) {
+		return nil
+	}
+	return err
+}
+
+func (e *Engine) recoverIfCheckpointAhead(ctx context.Context, next, tip uint64) uint64 {
+	if next <= tip+1000 {
+		return next
+	}
+	if maxRound, ok, mErr := e.sink.MaxBlockRound(ctx); mErr == nil && ok {
+		if maxRound > tip {
+			e.log.Warn("checkpoint ahead of tip; restarting from tip",
+				"checkpoint_next", next, "tip", tip, "max_stored", maxRound)
+			return tip
+		}
+		e.log.Warn("checkpoint ahead of tip; recovering from max stored block",
+			"checkpoint_next", next, "tip", tip, "max_stored", maxRound)
+		return maxRound + 1
+	}
+	e.log.Warn("checkpoint ahead of tip; restarting from tip",
+		"checkpoint_next", next, "tip", tip)
+	return tip
 }
 
 func (e *Engine) resolveStartRound(ctx context.Context) (uint64, error) {
@@ -100,7 +139,7 @@ func (e *Engine) resolveStartRound(ctx context.Context) (uint64, error) {
 		return explicit, nil
 	}
 
-	tip, err := e.client.LastRound(ctx)
+	tip, err := e.src.LastRound(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("resolve latest start: %w", err)
 	}
@@ -108,150 +147,393 @@ func (e *Engine) resolveStartRound(ctx context.Context) (uint64, error) {
 	return tip, nil
 }
 
-func (e *Engine) loop(ctx context.Context, next uint64) error {
-	workers := e.cfg.Sync.PrefetchWorkers
-	buffer := e.cfg.Sync.PrefetchBuffer
+func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
+	workers := e.cfg.Sync.Workers
+	window := e.cfg.Sync.FetchWindow
 	if workers < 1 {
 		workers = 1
 	}
-	if buffer < 1 {
-		buffer = workers
+	if window < workers {
+		window = workers
 	}
 
+	jobs := make(chan uint64, window)
+	results := make(chan fetchResult, window)
+
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.fetchWorker(workerCtx, jobs, results)
+		}()
+	}
+	defer func() {
+		workerCancel()
+		close(jobs)
+		wg.Wait()
+	}()
+
+	pending := make(map[uint64]block.Block)
+	nextFetch := nextCommit
+	inFlight := 0
+	var tip uint64
 	atTipLogged := false
+
+	var prevHash string
+	var havePrev bool
+	if nextCommit > 0 {
+		if h, ok, err := e.sink.BlockHash(ctx, nextCommit-1); err == nil && ok {
+			prevHash = h
+			havePrev = true
+		}
+	}
+
+	// Tracks when the commit head first became available for flush-interval.
+	var headReadyAt time.Time
+
+	refreshTip := func() error {
+		t, err := e.src.LastRound(ctx)
+		if err != nil {
+			return err
+		}
+		tip = t
+		if e.untilRound > 0 && e.untilRound < tip {
+			tip = e.untilRound
+		}
+		lastProcessed := uint64(0)
+		if nextCommit > 0 {
+			lastProcessed = nextCommit - 1
+		}
+		e.metrics.SetRounds(nextCommit, tip, lastProcessed)
+		return nil
+	}
+
+	if err := refreshTip(); err != nil {
+		return fmt.Errorf("initial tip: %w", err)
+	}
+
+	updateInFlight := func() {
+		e.metrics.SetInFlight(inFlight + len(pending))
+	}
+
+	tryFlush := func(force bool) error {
+		atTip := nextFetch > tip && inFlight == 0
+		batch, newPrev, err := e.collectBatch(pending, nextCommit, prevHash, havePrev, atTip || force)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			headReadyAt = time.Time{}
+			return nil
+		}
+
+		if !force && !e.shouldFlush(batch, nextCommit, pending, inFlight, nextFetch, tip, headReadyAt) {
+			if headReadyAt.IsZero() {
+				headReadyAt = time.Now()
+			}
+			return nil
+		}
+
+		for _, blk := range batch {
+			delete(pending, blk.Round)
+		}
+		updateInFlight()
+
+		start := time.Now()
+		if err := e.sink.CommitBatch(ctx, batch); err != nil {
+			// Put the whole batch back; checkpoint must not have advanced.
+			for _, blk := range batch {
+				pending[blk.Round] = blk
+			}
+			updateInFlight()
+			e.metrics.RecordError()
+			e.log.Error("batch commit failed; will retry",
+				"from", batch[0].Round, "to", batch[len(batch)-1].Round, "err", err)
+			if sleepErr := sleep(ctx, 500*time.Millisecond); sleepErr != nil {
+				return sleepErr
+			}
+			return nil
+		}
+		e.metrics.ObserveCommit(time.Since(start))
+
+		final := batch[len(batch)-1]
+		prevHash = newPrev
+		havePrev = true
+		nextCommit = final.Round + 1
+		headReadyAt = time.Time{}
+		for range batch {
+			e.metrics.RecordBlock()
+		}
+		e.metrics.SetRounds(nextCommit, tip, final.Round)
+		updateInFlight()
+		e.log.Debug("committed batch",
+			"from", batch[0].Round,
+			"to", final.Round,
+			"size", len(batch),
+			"latency", time.Since(start),
+		)
+
+		if e.untilRound > 0 && final.Round >= e.untilRound {
+			e.log.Info("reached until_round; stopping", "round", final.Round)
+			return errUntilReached
+		}
+		return nil
+	}
+
+	handleResult := func(res fetchResult) error {
+		inFlight--
+		if inFlight < 0 {
+			inFlight = 0
+		}
+		e.metrics.ObserveFetch(res.latency)
+
+		if res.err != nil {
+			e.metrics.RecordError()
+			e.log.Error("fetch failed; will retry", "round", res.round, "err", res.err)
+			if sleepErr := sleep(ctx, e.cfg.Sync.PollInterval); sleepErr != nil {
+				return sleepErr
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case jobs <- res.round:
+				inFlight++
+			}
+			updateInFlight()
+			return nil
+		}
+
+		if res.blk.Round != res.round {
+			e.metrics.RecordError()
+			return fmt.Errorf("algod returned round %d for requested %d", res.blk.Round, res.round)
+		}
+		pending[res.round] = res.blk
+		if res.round == nextCommit && headReadyAt.IsZero() {
+			headReadyAt = time.Now()
+		}
+		updateInFlight()
+
+		return tryFlush(false)
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		tip, err := e.client.LastRound(ctx)
-		if err != nil {
-			e.metrics.RecordError()
-			e.log.Error("failed to fetch tip", "err", err)
-			if sleepErr := sleep(ctx, e.cfg.Sync.PollInterval); sleepErr != nil {
-				return sleepErr
+		outstanding := inFlight + len(pending)
+		canDispatch := nextFetch <= tip && outstanding < window
+
+		// Live follow: at tip with an empty pipeline — flush any remainder first.
+		if !canDispatch && nextFetch > tip && outstanding == 0 {
+			if err := tryFlush(true); err != nil {
+				return err
 			}
-			continue
-		}
-
-		lastProcessed := uint64(0)
-		if next > 0 {
-			lastProcessed = next - 1
-		}
-		e.metrics.SetRounds(next, tip, lastProcessed)
-
-		if next > tip {
 			if !atTipLogged {
 				e.log.Info("caught up to tip; entering live follow", "tip", tip)
 				atTipLogged = true
 			}
-			st, err := e.client.WaitForBlockAfter(ctx, tip)
+			newTip, err := e.src.WaitForBlockAfter(ctx, tip)
 			if err != nil {
 				e.metrics.RecordError()
 				e.log.Warn("wait-for-block failed; polling", "err", err)
 				if sleepErr := sleep(ctx, e.cfg.Sync.PollInterval); sleepErr != nil {
 					return sleepErr
 				}
+				if err := refreshTip(); err != nil {
+					e.metrics.RecordError()
+					e.log.Error("failed to fetch tip", "err", err)
+				}
 				continue
 			}
-			tip = st.LastRound
-			if next > tip {
+			if newTip > tip {
+				tip = newTip
+			} else if err := refreshTip(); err != nil {
+				e.metrics.RecordError()
+			}
+			lastProcessed := uint64(0)
+			if nextCommit > 0 {
+				lastProcessed = nextCommit - 1
+			}
+			e.metrics.SetRounds(nextCommit, tip, lastProcessed)
+			continue
+		}
+
+		// Optional time-based partial flush (catch-up only).
+		if e.cfg.Sync.CommitFlushInterval > 0 && !headReadyAt.IsZero() {
+			if time.Since(headReadyAt) >= e.cfg.Sync.CommitFlushInterval {
+				if err := tryFlush(false); err != nil {
+					return err
+				}
 				continue
 			}
 		}
 
-		end := next + uint64(buffer) - 1
-		if end > tip {
-			end = tip
-		}
-
-		blocks, err := e.fetchRange(ctx, next, end, workers)
-		if err != nil {
-			e.metrics.RecordError()
-			e.log.Error("prefetch batch failed; will retry",
-				"from", next, "to", end, "err", err)
-			if sleepErr := sleep(ctx, e.cfg.Sync.PollInterval); sleepErr != nil {
-				return sleepErr
+		if canDispatch {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case jobs <- nextFetch:
+				nextFetch++
+				inFlight++
+				updateInFlight()
+			case res := <-results:
+				if err := handleResult(res); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 
-		batchStart := next
-		for i, blk := range blocks {
-			round := batchStart + uint64(i)
-			if blk.Round != round {
-				e.metrics.RecordError()
-				return fmt.Errorf("unexpected block round %d (want %d)", blk.Round, round)
+		// Window full / waiting on fetches. Cap wait so flush-interval can fire.
+		wait := 50 * time.Millisecond
+		if e.cfg.Sync.CommitFlushInterval > 0 && !headReadyAt.IsZero() {
+			if rem := e.cfg.Sync.CommitFlushInterval - time.Since(headReadyAt); rem > 0 && rem < wait {
+				wait = rem
 			}
-			if err := e.commit(ctx, blk); err != nil {
-				e.metrics.RecordError()
-				e.log.Error("commit failed; will retry", "round", round, "err", err)
-				if sleepErr := sleep(ctx, 500*time.Millisecond); sleepErr != nil {
-					return sleepErr
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case res := <-results:
+			timer.Stop()
+			if err := handleResult(res); err != nil {
+				return err
+			}
+			if nextFetch > tip {
+				if err := refreshTip(); err != nil {
+					e.metrics.RecordError()
+					e.log.Warn("tip refresh failed", "err", err)
 				}
-				break
 			}
-			next = round + 1
-			e.metrics.SetRounds(next, tip, round)
-			e.metrics.RecordBlock()
+		case <-timer.C:
+			if err := tryFlush(false); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-func (e *Engine) fetchRange(ctx context.Context, from, to uint64, workers int) ([]block.Block, error) {
-	if to < from {
-		return nil, nil
+// collectBatch gathers a contiguous validated prefix from pending.
+// When forceOrLive is true, the max size is 1 (live / tip flush).
+func (e *Engine) collectBatch(
+	pending map[uint64]block.Block,
+	nextCommit uint64,
+	prevHash string,
+	havePrev bool,
+	forceOrLive bool,
+) ([]block.Block, string, error) {
+	max := e.cfg.Sync.CommitBatchSize
+	if max < 1 {
+		max = 1
 	}
-	n := int(to - from + 1)
-	out := make([]block.Block, n)
-	var mu sync.Mutex
+	if forceOrLive {
+		max = 1
+	}
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(workers)
-	for i := 0; i < n; i++ {
-		i := i
-		round := from + uint64(i)
-		g.Go(func() error {
-			blk, err := e.client.FetchBlock(gctx, round)
-			if err != nil {
-				return fmt.Errorf("fetch round %d: %w", round, err)
-			}
-			if blk.Round != round {
-				return fmt.Errorf("algod returned round %d for requested %d", blk.Round, round)
-			}
-			mu.Lock()
-			out[i] = blk
-			mu.Unlock()
-			return nil
-		})
+	batch := make([]block.Block, 0, max)
+	hash := prevHash
+	have := havePrev
+
+	for len(batch) < max {
+		r := nextCommit + uint64(len(batch))
+		blk, ok := pending[r]
+		if !ok {
+			break
+		}
+		if err := validateBlock(blk, hash, have); err != nil {
+			return nil, prevHash, err
+		}
+		batch = append(batch, blk)
+		hash = blk.BlockHash
+		have = true
+		if e.untilRound > 0 && blk.Round >= e.untilRound {
+			break
+		}
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return batch, hash, nil
 }
 
-func (e *Engine) commit(ctx context.Context, blk block.Block) error {
-	if blk.Round > 0 {
-		prevHash, ok, err := e.sink.BlockHash(ctx, blk.Round-1)
-		if err != nil {
-			return err
-		}
-		if ok && prevHash != "" && blk.PreviousBlockHash != "" && prevHash != blk.PreviousBlockHash {
-			return fmt.Errorf("chain break at round %d: prev=%s stored=%s",
-				blk.Round, blk.PreviousBlockHash, prevHash)
+func (e *Engine) shouldFlush(
+	batch []block.Block,
+	nextCommit uint64,
+	pending map[uint64]block.Block,
+	inFlight int,
+	nextFetch, tip uint64,
+	headReadyAt time.Time,
+) bool {
+	max := e.cfg.Sync.CommitBatchSize
+	if max < 1 {
+		max = 1
+	}
+	if len(batch) >= max {
+		return true
+	}
+	if e.untilRound > 0 && batch[len(batch)-1].Round >= e.untilRound {
+		return true
+	}
+
+	atTip := nextFetch > tip && inFlight == 0
+	if atTip {
+		return true
+	}
+
+	// Contiguous prefix cannot grow: next round is neither pending nor still fetching.
+	nextNeeded := nextCommit + uint64(len(batch))
+	if _, ok := pending[nextNeeded]; !ok {
+		stillComing := inFlight > 0 || nextFetch <= nextNeeded
+		if !stillComing {
+			return true
 		}
 	}
 
-	if err := e.sink.ProcessBlock(ctx, blk); err != nil {
-		return err
+	if e.cfg.Sync.CommitFlushInterval > 0 && !headReadyAt.IsZero() {
+		if time.Since(headReadyAt) >= e.cfg.Sync.CommitFlushInterval {
+			return true
+		}
 	}
-	e.log.Debug("committed block",
-		"round", blk.Round,
-		"hash", blk.BlockHash,
-		"txns", blk.TxnCount,
-	)
+	return false
+}
+
+func (e *Engine) fetchWorker(ctx context.Context, jobs <-chan uint64, results chan<- fetchResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case round, ok := <-jobs:
+			if !ok {
+				return
+			}
+			e.metrics.WorkerStart()
+			start := time.Now()
+			blk, err := e.src.GetBlock(ctx, round)
+			latency := time.Since(start)
+			e.metrics.WorkerDone()
+
+			res := fetchResult{round: round, blk: blk, err: err, latency: latency}
+			select {
+			case <-ctx.Done():
+				return
+			case results <- res:
+			}
+		}
+	}
+}
+
+func validateBlock(blk block.Block, prevHash string, havePrev bool) error {
+	if blk.BlockHash == "" {
+		return fmt.Errorf("missing block hash at round %d", blk.Round)
+	}
+	if havePrev && prevHash != "" && blk.PreviousBlockHash != "" && prevHash != blk.PreviousBlockHash {
+		return fmt.Errorf("chain break at round %d: prev=%s stored=%s",
+			blk.Round, blk.PreviousBlockHash, prevHash)
+	}
 	return nil
 }
 

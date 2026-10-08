@@ -14,11 +14,12 @@ const StartRoundLatest = "latest"
 
 // Config holds runtime configuration for the follower.
 type Config struct {
-	Network string         `yaml:"network"`
-	Node    NodeConfig     `yaml:"node"`
-	Sync    SyncConfig     `yaml:"sync"`
+	Network  string         `yaml:"network"`
+	Node     NodeConfig     `yaml:"node"`
+	Sync     SyncConfig     `yaml:"sync"`
 	Database DatabaseConfig `yaml:"database"`
-	Metrics MetricsConfig  `yaml:"metrics"`
+	Metrics  MetricsConfig  `yaml:"metrics"`
+	Log      LogConfig      `yaml:"log"`
 }
 
 type NodeConfig struct {
@@ -27,11 +28,23 @@ type NodeConfig struct {
 }
 
 type SyncConfig struct {
-	StartRound       string        `yaml:"start_round"`
-	Mode             string        `yaml:"mode"`
-	PollInterval     time.Duration `yaml:"poll_interval"`
-	PrefetchWorkers  int           `yaml:"prefetch_workers"`
-	PrefetchBuffer   int           `yaml:"prefetch_buffer"`
+	StartRound   string        `yaml:"start_round"`
+	Mode         string        `yaml:"mode"`
+	PollInterval time.Duration `yaml:"poll_interval"`
+	// Workers is the concurrent BlockRaw fetch pool size (default 32).
+	Workers int `yaml:"workers"`
+	// FetchWindow bounds in-flight (fetched-but-not-committed) rounds.
+	FetchWindow int `yaml:"fetch_window"`
+	// CommitBatchSize is the max contiguous blocks per sink commit during
+	// catch-up. Live follow forces batch size 1. Default 100.
+	CommitBatchSize int `yaml:"commit_batch_size"`
+	// CommitFlushInterval flushes a partial catch-up batch after this delay
+	// waiting for more contiguous rounds (0 disables time-based flush).
+	CommitFlushInterval time.Duration `yaml:"commit_flush_interval"`
+
+	// Legacy YAML keys — still accepted via Unmarshal aliases below.
+	PrefetchWorkers int `yaml:"prefetch_workers"`
+	PrefetchBuffer  int `yaml:"prefetch_buffer"`
 }
 
 type DatabaseConfig struct {
@@ -40,6 +53,10 @@ type DatabaseConfig struct {
 
 type MetricsConfig struct {
 	Addr string `yaml:"addr"`
+}
+
+type LogConfig struct {
+	Level string `yaml:"level"`
 }
 
 // Load reads optional YAML from path, then applies environment overrides.
@@ -71,17 +88,23 @@ func defaults() *Config {
 			AlgodURL: "",
 		},
 		Sync: SyncConfig{
-			StartRound:      StartRoundLatest,
-			Mode:            "fast",
-			PollInterval:    100 * time.Millisecond,
-			PrefetchWorkers: 16,
-			PrefetchBuffer:  32,
+			StartRound:   StartRoundLatest,
+			Mode:         "fast",
+			PollInterval: 100 * time.Millisecond,
+			// Workers/FetchWindow default in Validate so legacy YAML keys can apply.
+			Workers:             0,
+			FetchWindow:         0,
+			CommitBatchSize:     0, // defaulted in Validate
+			CommitFlushInterval: 200 * time.Millisecond,
 		},
 		Database: DatabaseConfig{
 			URL: "",
 		},
 		Metrics: MetricsConfig{
 			Addr: ":9090",
+		},
+		Log: LogConfig{
+			Level: "info",
 		},
 	}
 }
@@ -96,6 +119,9 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("VOI_START_ROUND"); v != "" {
 		cfg.Sync.StartRound = v
 	}
+	if v := os.Getenv("START_ROUND"); v != "" {
+		cfg.Sync.StartRound = v
+	}
 	if v := os.Getenv("VOI_SYNC_MODE"); v != "" {
 		cfg.Sync.Mode = v
 	}
@@ -107,14 +133,35 @@ func applyEnv(cfg *Config) {
 			cfg.Sync.PollInterval = d
 		}
 	}
+	// Legacy aliases first; preferred Phase 1 names win when both are set.
 	if v := os.Getenv("PREFETCH_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Sync.PrefetchWorkers = n
+			cfg.Sync.Workers = n
 		}
 	}
 	if v := os.Getenv("PREFETCH_BUFFER"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Sync.PrefetchBuffer = n
+			cfg.Sync.FetchWindow = n
+		}
+	}
+	if v := os.Getenv("WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Sync.Workers = n
+		}
+	}
+	if v := os.Getenv("FETCH_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Sync.FetchWindow = n
+		}
+	}
+	if v := os.Getenv("COMMIT_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Sync.CommitBatchSize = n
+		}
+	}
+	if v := os.Getenv("COMMIT_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Sync.CommitFlushInterval = d
 		}
 	}
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
@@ -123,8 +170,8 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("VOI_NETWORK"); v != "" {
 		cfg.Network = v
 	}
-	if v := os.Getenv("CONFIG_PATH"); v != "" {
-		_ = v // documented; Load() receives path from main
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		cfg.Log.Level = v
 	}
 }
 
@@ -139,16 +186,45 @@ func (c *Config) Validate() error {
 	if c.Sync.PollInterval <= 0 {
 		c.Sync.PollInterval = 100 * time.Millisecond
 	}
-	if c.Sync.PrefetchWorkers < 1 {
-		c.Sync.PrefetchWorkers = 1
+
+	// Prefer workers/fetch_window; fall back to legacy prefetch_* keys; then defaults.
+	if c.Sync.Workers < 1 {
+		if c.Sync.PrefetchWorkers > 0 {
+			c.Sync.Workers = c.Sync.PrefetchWorkers
+		} else {
+			c.Sync.Workers = 32
+		}
 	}
-	if c.Sync.PrefetchBuffer < 1 {
-		c.Sync.PrefetchBuffer = c.Sync.PrefetchWorkers
+	if c.Sync.FetchWindow < 1 {
+		if c.Sync.PrefetchBuffer > 0 {
+			c.Sync.FetchWindow = c.Sync.PrefetchBuffer
+		} else {
+			c.Sync.FetchWindow = c.Sync.Workers * 2
+		}
 	}
+	// Window must be at least large enough for the worker pool to stay busy.
+	if c.Sync.FetchWindow < c.Sync.Workers {
+		c.Sync.FetchWindow = c.Sync.Workers
+	}
+	if c.Sync.CommitBatchSize < 1 {
+		// Benchmarked sweet spot on mainnet catch-up; see README Phase 2.
+		c.Sync.CommitBatchSize = 50
+	}
+	// Keep the fetch window large enough to fill a commit batch.
+	if c.Sync.FetchWindow < c.Sync.CommitBatchSize {
+		c.Sync.FetchWindow = c.Sync.CommitBatchSize
+	}
+	if c.Sync.CommitFlushInterval < 0 {
+		c.Sync.CommitFlushInterval = 0
+	}
+
 	if strings.EqualFold(c.Sync.Mode, "fast") {
 		// ok
 	} else if c.Sync.Mode == "" {
 		c.Sync.Mode = "fast"
+	}
+	if strings.TrimSpace(c.Log.Level) == "" {
+		c.Log.Level = "info"
 	}
 	sr := strings.TrimSpace(c.Sync.StartRound)
 	if sr == "" {

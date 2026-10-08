@@ -63,8 +63,9 @@ func (c *Client) LastRound(ctx context.Context) (uint64, error) {
 	return st.LastRound, nil
 }
 
-// FetchBlock retrieves and decodes a single block by round.
-func (c *Client) FetchBlock(ctx context.Context, round uint64) (block.Block, error) {
+// GetBlock retrieves a block via msgpack BlockRaw and decodes it.
+// The original raw msgpack bytes are preserved on the returned Block.
+func (c *Client) GetBlock(ctx context.Context, round uint64) (block.Block, error) {
 	var raw []byte
 	err := c.withRetry(ctx, fmt.Sprintf("block/%d", round), func(ctx context.Context) error {
 		var err error
@@ -75,6 +76,11 @@ func (c *Client) FetchBlock(ctx context.Context, round uint64) (block.Block, err
 		return block.Block{}, err
 	}
 	return block.DecodeRaw(raw)
+}
+
+// FetchBlock is an alias for GetBlock (kept for older call sites/tests).
+func (c *Client) FetchBlock(ctx context.Context, round uint64) (block.Block, error) {
+	return c.GetBlock(ctx, round)
 }
 
 // AccountBalance returns the microVOI balance for an address (best-effort).
@@ -101,15 +107,19 @@ func (c *Client) AccountBalance(ctx context.Context, address string) (uint64, er
 	return 0, last
 }
 
-// WaitForBlockAfter waits until a block after round is available.
-func (c *Client) WaitForBlockAfter(ctx context.Context, round uint64) (models.NodeStatus, error) {
+// WaitForBlockAfter waits until a block after round is available and returns
+// the new network tip (last-round).
+func (c *Client) WaitForBlockAfter(ctx context.Context, round uint64) (uint64, error) {
 	var status models.NodeStatus
 	err := c.withRetry(ctx, fmt.Sprintf("wait-after/%d", round), func(ctx context.Context) error {
 		var err error
 		status, err = c.algod.StatusAfterBlock(round).Do(ctx)
 		return err
 	})
-	return status, err
+	if err != nil {
+		return 0, err
+	}
+	return status.LastRound, nil
 }
 
 func (c *Client) withRetry(ctx context.Context, op string, fn func(context.Context) error) error {
