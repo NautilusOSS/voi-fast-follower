@@ -128,16 +128,32 @@ go run ./cmd/bench -mode e2e -count 1000 -workers 32 -batch 50 -reset
 
 Reports start/end round, elapsed time, blocks/sec, and commit latency (avg/p50/p95).
 
-### Phase 2 results (1000 mainnet rounds, 32 workers, durable `synchronous_commit`)
+### Phase 2 results (remote Nodely, durable `synchronous_commit`)
 
 | Batch | Blocks/sec | Notes |
 |------:|-----------:|-------|
-| fetch-only | ~135 | Upper bound (no Postgres) |
-| 1 | ~41 | UNNEST single-block commit |
-| 10 | ~45 | |
-| **50** | **~45** | **Default — best practical** |
-| 100 | ~39 | Diminishing returns |
-| 500 | ~8 | Too large; fill/txn cost dominates |
+| fetch-only | ~125–245 | Public algod ceiling |
+| **50** | **~42–45** | Fetch-bound against Nodely |
+
+### Phase 3 — local Voi algod
+
+See [docs/phase3-local-node.md](docs/phase3-local-node.md).
+
+| Mode | Nodely | Local algod |
+|---|---:|---:|
+| Fetch-only (best workers) | ~245 | **~2,300–2,900** |
+| E2E batch=10 | ~39 | **~540** (peak) |
+| E2E batch=50 | ~42 | ~237 |
+
+**Conclusion:** remote e2e ~45 blk/s was acquisition-bound. Local acquisition is ~20× faster; Postgres then becomes the next limiter (~hundreds of blk/s).
+
+```bash
+docker compose up -d postgres voi-node
+# After catchup (see docs/phase3-local-node.md):
+export VOI_ALGOD_URL=http://127.0.0.1:4001
+export VOI_ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+./scripts/phase3-local.sh
+```
 
 ## Tests
 

@@ -15,6 +15,35 @@ services:
       timeout: 5s
       retries: 10
 
+  # Local Voi mainnet algod for Phase 3 benchmarks (REST API only).
+  # Uses xarmian/voinode (arm64-friendly) with Voi genesis + fast catchup.
+  # Official ghcr.io/voinetwork/voi-node is amd64-only and crashes under QEMU
+  # on Apple Silicon (Go lfstack.push).
+  voi-node:
+    image: xarmian/voinode:latest
+    platform: linux/arm64
+    environment:
+      NETWORK: voimain-v1.0
+      FAST_CATCHUP: "1"
+      TOKEN: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      TELEMETRY_NAME: ""
+    ports:
+      # Host 4001 avoids local Vite/dev servers commonly bound to 8080.
+      - "4001:8080"
+    volumes:
+      - voi-algod-data:/algod/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H 'X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' http://127.0.0.1:8080/v2/status >/dev/null",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
   follower:
     build: .
     depends_on:
@@ -39,19 +68,6 @@ services:
       - "9090:9090"
     restart: unless-stopped
 
-  # Optional local Voi follower node for Conduit-style testing.
-  # Uncomment and point VOI_ALGOD_URL at http://voi-node:8080.
-  #
-  # voi-node:
-  #   image: ghcr.io/voinetwork/voi-node:latest
-  #   environment:
-  #     VOINETWORK_NETWORK: mainnet
-  #     VOINETWORK_PROFILE: conduit
-  #     VOINETWORK_CATCHUP: "0"
-  #   volumes:
-  #     - voi-algod-data:/algod/data
-  #   restart: unless-stopped
-
 volumes:
   postgres-data:
-  # voi-algod-data:
+  voi-algod-data:

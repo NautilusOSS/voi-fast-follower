@@ -218,6 +218,14 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 
 	updateInFlight := func() {
 		e.metrics.SetInFlight(inFlight + len(pending))
+		awaiting := 0
+		for r := nextCommit; ; r++ {
+			if _, ok := pending[r]; !ok {
+				break
+			}
+			awaiting++
+		}
+		e.metrics.SetBufferDepth(len(pending), awaiting)
 	}
 
 	tryFlush := func(force bool) error {
@@ -312,6 +320,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 			return fmt.Errorf("algod returned round %d for requested %d", res.blk.Round, res.round)
 		}
 		pending[res.round] = res.blk
+		e.metrics.RecordFetch()
 		if res.round == nextCommit && headReadyAt.IsZero() {
 			headReadyAt = time.Now()
 		}
