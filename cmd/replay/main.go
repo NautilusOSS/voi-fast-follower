@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/storage"
 )
 
 func main() {

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 const (

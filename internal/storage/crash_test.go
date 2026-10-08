@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // TestCrashRecoveryBatchSemantics validates Phase 2/3 checkpoint invariants:

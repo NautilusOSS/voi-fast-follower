@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // MultiSink fans a canonical ordered stream out to multiple BatchBlockSinks.

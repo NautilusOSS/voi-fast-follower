@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 func TestPostgresIdempotentCommit(t *testing.T) {

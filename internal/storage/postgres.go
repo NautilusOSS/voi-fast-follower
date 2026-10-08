@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 const checkpointKey = "last_processed_round"

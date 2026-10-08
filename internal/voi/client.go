@@ -13,7 +13,7 @@ import (
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/common"
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/common/models"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // Client wraps algod with retry/backoff for node outages.

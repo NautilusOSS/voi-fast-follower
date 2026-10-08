@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/voi"
+	"github.com/NautilusOSS/voi-fast-follower/internal/storage"
+	"github.com/NautilusOSS/voi-fast-follower/internal/voi"
 )
 
 // Server exposes a tiny read-only explorer API over the follower DB.

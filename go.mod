@@ -1,4 +1,4 @@
-module github.com/nicholasshellabarger/voi-fast-follower
+module github.com/NautilusOSS/voi-fast-follower
 
 go 1.25.0
 

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/health"
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/metrics"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/health"
+	"github.com/NautilusOSS/voi-fast-follower/internal/metrics"
 )
 
 // advancingSource simulates catch-up then live tip growth.

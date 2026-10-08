@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // BlockSink is the persistence/delivery abstraction for the canonical Block stream.

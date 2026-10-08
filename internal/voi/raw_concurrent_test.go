@@ -8,7 +8,7 @@ import (
 
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // TestConcurrentRawThenSerialDecode isolates whether HTTP or decode corrupts rounds.

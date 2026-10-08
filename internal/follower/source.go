@@ -3,7 +3,7 @@ package follower
 import (
 	"context"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
+	"github.com/NautilusOSS/voi-fast-follower/internal/block"
 )
 
 // BlockSource is the network-facing abstraction used by the follower engine.

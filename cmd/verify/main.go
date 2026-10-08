@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
+	"github.com/NautilusOSS/voi-fast-follower/internal/storage"
 )
 
 func main() {
