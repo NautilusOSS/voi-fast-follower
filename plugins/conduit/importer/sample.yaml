@@ -5,8 +5,8 @@ config:
   # Network genesis JSON (required by Conduit; not fetched from Voi by this plugin).
   genesis_file: "/data/genesis.json"
   # offline: fail if round is past archive checkpoint
-  # follow: poll until the archive advances (live Conduit against a growing archive)
-  mode: "follow"
+  # follow / bootstrap: poll until the archive advances (historical then live via follower)
+  mode: "bootstrap"
   poll_interval: "200ms"
   # 0 = wait until context cancel only (follow mode)
   wait_timeout: "0s"

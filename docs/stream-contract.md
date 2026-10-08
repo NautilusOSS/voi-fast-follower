@@ -1,8 +1,10 @@
 # Voi Fast Follower — Block Stream Contract
 
 This document defines the **delivery contract** of the canonical ordered block stream.
-Downstream consumers (Postgres, archive, Conduit `voi_archive` importer) can rely on these
-guarantees without understanding how blocks are fetched. See [phase7-conduit-adapter.md](phase7-conduit-adapter.md).
+Downstream consumers (Postgres, archive, Conduit `voi_archive` importer, bootstrap handoff)
+can rely on these guarantees without understanding how blocks are fetched.
+See [phase7-conduit-adapter.md](phase7-conduit-adapter.md) and
+[phase8-bootstrap-history.md](phase8-bootstrap-history.md).
 
 ## What the follower owns
 

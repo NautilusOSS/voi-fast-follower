@@ -42,6 +42,10 @@ type Metrics struct {
 	ArchiveErrors      prometheus.Counter
 	SinkCommitLatency  *prometheus.HistogramVec
 	SinkErrors         *prometheus.CounterVec
+	BootstrapPhase     prometheus.Gauge
+	ArchiveReplayTotal prometheus.Counter
+	ArchiveReplayBPS   prometheus.Gauge
+	HandoffRound       prometheus.Gauge
 
 	processed     atomic.Uint64
 	fetched       atomic.Uint64
@@ -50,6 +54,8 @@ type Metrics struct {
 	fetchWinStart atomic.Int64
 	fetchWinCount atomic.Uint64
 	busy          atomic.Int64
+	replayStart   atomic.Int64
+	replayCount   atomic.Uint64
 }
 
 var (
@@ -161,6 +167,22 @@ func New() *Metrics {
 			Name: "voi_follower_sink_errors_total",
 			Help: "Per-sink commit errors",
 		}, []string{"sink"}),
+		BootstrapPhase: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "voi_follower_bootstrap_phase",
+			Help: "0=historical 1=handoff 2=live 3=waiting 4=failed",
+		}),
+		ArchiveReplayTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "voi_follower_archive_replay_blocks_total",
+			Help: "Blocks read from archive during bootstrap/replay",
+		}),
+		ArchiveReplayBPS: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "voi_follower_archive_replay_blocks_per_second",
+			Help: "Recent archive replay read throughput",
+		}),
+		HandoffRound: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "voi_follower_handoff_round",
+			Help: "Archive tip round at last successful archive→live handoff",
+		}),
 	}
 	reg.MustRegister(
 		m.CurrentRound,
@@ -185,10 +207,15 @@ func New() *Metrics {
 		m.ArchiveErrors,
 		m.SinkCommitLatency,
 		m.SinkErrors,
+		m.BootstrapPhase,
+		m.ArchiveReplayTotal,
+		m.ArchiveReplayBPS,
+		m.HandoffRound,
 	)
 	now := time.Now().UnixNano()
 	m.windowStart.Store(now)
 	m.fetchWinStart.Store(now)
+	m.replayStart.Store(now)
 	return m
 }
 
@@ -309,6 +336,30 @@ func (m *Metrics) ObserveSinkCommit(sink string, d time.Duration, err error) {
 		if sink == "archive" {
 			m.ArchiveErrors.Inc()
 		}
+	}
+}
+
+// SetBootstrapPhase records historical/handoff/live/waiting/failed (0–4).
+func (m *Metrics) SetBootstrapPhase(v float64) {
+	m.BootstrapPhase.Set(v)
+}
+
+// SetHandoffRound records the archive tip at handoff.
+func (m *Metrics) SetHandoffRound(round uint64) {
+	m.HandoffRound.Set(float64(round))
+}
+
+// RecordArchiveReplay increments archive replay counters/throughput.
+func (m *Metrics) RecordArchiveReplay() {
+	m.ArchiveReplayTotal.Inc()
+	m.replayCount.Add(1)
+	now := time.Now().UnixNano()
+	start := m.replayStart.Load()
+	elapsed := time.Duration(now - start)
+	if elapsed >= time.Second {
+		count := m.replayCount.Swap(0)
+		m.replayStart.Store(now)
+		m.ArchiveReplayBPS.Set(float64(count) / elapsed.Seconds())
 	}
 }
 

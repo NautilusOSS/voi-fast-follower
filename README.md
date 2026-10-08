@@ -18,26 +18,21 @@ See the [stream contract](docs/stream-contract.md) for ordering, at-least-once d
 | Bounded, backpressured catch-up + live follow | Exactly-once messaging |
 
 ```text
-              ┌──────────────┐
-              │   Voi node   │
-              └──────┬───────┘
-                     ↓
-             Voi Fast Follower
-                     ↓
-          ordered raw Block stream
-                     ↓
-          ┌──────────┴───────────┐
-          ↓                      ↓
-      PostgreSQL              Archive
-                                 ↓
-                              Replay / stream
-                                 ↓
-                         Conduit (optional)
+                    Voi Network
+                         ↓
+                    local algod
+                         ↓
+                  Fast Follower
+                         ↓
+                 durable archive
+                   ↓           ↓
+                live          replay / bootstrap
+              consumers       consumers (Postgres, Conduit, …)
 ```
 
-**Fast Follower handles synchronization. Conduit handles indexing/processing.**
+**Voi provides the live chain. Fast Follower provides synchronization. Archive provides durable history.**
 
-Conduit is an optional downstream consumer (`plugins/conduit`, importer `voi_archive`). Core follower builds do not require the Conduit module. See [docs/phase7-conduit-adapter.md](docs/phase7-conduit-adapter.md).
+Consumers bootstrap from the archive (no historical Voi lookback) then follow live blocks. Optional Conduit importer: `voi_archive`. See [docs/phase8-bootstrap-history.md](docs/phase8-bootstrap-history.md) and [docs/phase7-conduit-adapter.md](docs/phase7-conduit-adapter.md).
 
 ## Guarantees (summary)
 
@@ -250,6 +245,26 @@ VOI_ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 Standalone paths still work without Conduit: Postgres, Archive, MultiSink, and archive replay.
 
+### Phase 8 — Bootstrap & long-range history
+
+See [docs/phase8-bootstrap-history.md](docs/phase8-bootstrap-history.md).
+
+```bash
+# Offline historical bootstrap (no Voi)
+go run ./cmd/replay -archive ./archive -start N -end M -sink postgres -database "$DATABASE_URL"
+
+# Archive → live handoff → sink
+go run ./cmd/bootstrap -archive ./archive -start N -end TIP \
+  -sink postgres -database "$DATABASE_URL" -algod "$VOI_ALGOD_URL"
+
+# Move / verify / compare archives
+go run ./cmd/archive-export -archive ./archive -out ./bundle -start N -end M
+go run ./cmd/archive-import -in ./bundle -archive ./archive-new
+go run ./cmd/archive-compare -a ./archive -b ./archive-new -start N -end M
+go run ./cmd/verify -archive ./archive
+go run ./cmd/archive-prune -archive ./archive -keep-rounds 500000
+```
+
 ```bash
 docker compose up -d postgres voi-node
 # After catchup (see docs/phase3-local-node.md):
@@ -283,13 +298,15 @@ Follower unit tests cover sequential ingestion, out-of-order fetch, ordered comm
 cmd/follower/main.go
 cmd/bench/main.go
 cmd/replay/main.go        # archive → sink (offline)
+cmd/bootstrap/main.go     # archive → live handoff → sink
 cmd/verify/main.go        # archive integrity
 cmd/archive-info/main.go  # archive metadata
+cmd/archive-export|import|compare|prune/
 internal/config/
 internal/voi/             # GetBlock, WaitForBlockAfter
 internal/block/           # canonical Block + msgpack decode
 internal/follower/        # worker pool + ordered stream
-internal/stream/          # RoundSource / Cursor (consumer boundary)
+internal/stream/          # RoundSource, HandoffSource, Cursor
 internal/conduit/         # translate + delivery (no Conduit module dep)
 internal/storage/         # BlockSink, Postgres, Archive, MultiSink
 internal/health/          # /healthz /readyz state
@@ -298,6 +315,7 @@ plugins/conduit/          # optional Conduit binary + voi_archive importer
 migrations/
 docs/stream-contract.md
 docs/phase7-conduit-adapter.md
+docs/phase8-bootstrap-history.md
 scripts/phase5-pipelines.sh
 scripts/phase7-demo.sh
 ```

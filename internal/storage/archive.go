@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +51,7 @@ type ArchiveSink struct {
 	mu         sync.Mutex
 	checkpoint uint64 // 0 = none
 	hasCP      bool
+	segIndex   []segRef // sorted segment starts for O(log n) file lookup
 
 	bytesWritten uint64
 	onBytes      func(n int)
@@ -87,6 +87,9 @@ func NewArchive(opts ArchiveOptions) (*ArchiveSink, error) {
 		return nil, err
 	}
 	if err := s.reconcile(); err != nil {
+		return nil, err
+	}
+	if err := s.rebuildIndexLocked(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -454,6 +457,7 @@ func (s *ArchiveSink) CommitBatch(ctx context.Context, blocks []block.Block) err
 	if s.onBytes != nil {
 		s.onBytes(written)
 	}
+	_ = s.rebuildIndexLocked()
 	return nil
 }
 
@@ -567,37 +571,35 @@ func (s *ArchiveSink) GetBlock(ctx context.Context, round uint64) (block.Block, 
 }
 
 func (s *ArchiveSink) readRoundLocked(round uint64) (archiveRecord, error) {
-	// Fast path: segment naming for this process's segmentSize.
-	path := s.segmentPath(s.segmentStart(round))
-	if rec, err := readRoundFromSegment(path, round); err == nil {
-		return rec, nil
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) {
-		// Keep scanning on miss; only abort on unexpected I/O errors from an existing file.
-		if !errors.Is(err, errRoundNotInSegment) {
+	// Index-assisted path (works across SegmentSize mismatches via filename starts).
+	if path, ok := s.segmentPathForRoundLocked(round); ok {
+		rec, err := readRoundFromSegment(path, round)
+		if err == nil {
+			return rec, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) && !errors.Is(err, errRoundNotInSegment) {
 			return archiveRecord{}, err
 		}
 	}
 
-	// Fallback: scan all segments. Needed when an archive is reopened with a
-	// different SegmentSize than it was written with (segmentSize is not yet
-	// persisted in archive metadata).
-	entries, err := os.ReadDir(s.segmentsDir())
-	if err != nil {
+	// Fallback: naming based on this process's segmentSize, then full scan.
+	path := s.segmentPath(s.segmentStart(round))
+	if rec, err := readRoundFromSegment(path, round); err == nil {
+		return rec, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) && !errors.Is(err, errRoundNotInSegment) {
 		return archiveRecord{}, err
 	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".seg") {
-			names = append(names, e.Name())
+
+	if len(s.segIndex) == 0 {
+		if err := s.rebuildIndexLocked(); err != nil {
+			return archiveRecord{}, err
 		}
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		p := filepath.Join(s.segmentsDir(), name)
-		if p == path {
-			continue // already tried
+	for _, ref := range s.segIndex {
+		if ref.path == path {
+			continue
 		}
-		rec, err := readRoundFromSegment(p, round)
+		rec, err := readRoundFromSegment(ref.path, round)
 		if err == nil {
 			return rec, nil
 		}
@@ -650,127 +652,13 @@ func (s *ArchiveSink) Close() error { return nil }
 // Root returns the archive directory.
 func (s *ArchiveSink) Root() string { return s.root }
 
-// ReadArchiveBlocks yields blocks in [from, to] inclusive from a durable archive.
-// It reconstructs Block via DecodeRaw and verifies stored hashes/linkage.
+// ReadArchiveBlocks loads blocks in [from, to] inclusive from a durable archive.
+// For large ranges prefer IterateArchiveBlocks to avoid holding the full slice.
 func ReadArchiveBlocks(root string, from, to uint64) ([]block.Block, error) {
-	if to < from {
-		return nil, fmt.Errorf("invalid range %d-%d", from, to)
-	}
-	s, err := NewArchive(ArchiveOptions{Root: root})
-	if err != nil {
-		return nil, err
-	}
-	defer s.Close()
-
-	cp, ok, err := s.LastProcessedRound(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("archive has no checkpoint")
-	}
-	if to > cp {
-		return nil, fmt.Errorf("end round %d past checkpoint %d", to, cp)
-	}
-
 	var out []block.Block
-	var prevHash string
-	havePrev := false
-	if from > 0 {
-		// Load previous hash for linkage when available.
-		if h, ok, err := s.BlockHash(context.Background(), from-1); err == nil && ok {
-			prevHash = h
-			havePrev = true
-		}
-	}
-
-	segDir := filepath.Join(root, segmentsDirName)
-	entries, err := os.ReadDir(segDir)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".seg") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		path := filepath.Join(segDir, name)
-		blocks, err := readSegmentRange(path, from, to)
-		if err != nil {
-			return nil, err
-		}
-		for _, blk := range blocks {
-			if havePrev {
-				if err := block.ValidateLinkage(prevHash, blk); err != nil {
-					return nil, fmt.Errorf("round %d: %w", blk.Round, err)
-				}
-			}
-			if blk.BlockHash == "" {
-				return nil, fmt.Errorf("round %d: empty hash", blk.Round)
-			}
-			out = append(out, blk)
-			prevHash = blk.BlockHash
-			havePrev = true
-		}
-	}
-	if uint64(len(out)) != to-from+1 {
-		return nil, fmt.Errorf("archive incomplete: got %d blocks want %d", len(out), to-from+1)
-	}
-	return out, nil
-}
-
-func readSegmentRange(path string, from, to uint64) ([]block.Block, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	start, err := readSegmentHeader(f)
-	if err != nil {
-		return nil, err
-	}
-	_ = start
-	var out []block.Block
-	off := int64(archiveHeaderSize)
-	for {
-		rec, n, err := readRecordAt(f, off)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		off += n
-		if rec.Round < from {
-			continue
-		}
-		if rec.Round > to {
-			break
-		}
-		blk := block.Block{
-			Round:             rec.Round,
-			BlockHash:         rec.Hash,
-			PreviousBlockHash: rec.PrevHash,
-			Raw:               append([]byte(nil), rec.Raw...),
-		}
-		// Prefer full decode when raw is a real algod BlockRaw payload.
-		if decoded, err := block.DecodeRaw(rec.Raw); err == nil {
-			if decoded.Round != rec.Round {
-				return nil, fmt.Errorf("round mismatch stored=%d decoded=%d", rec.Round, decoded.Round)
-			}
-			if decoded.BlockHash != rec.Hash {
-				return nil, fmt.Errorf("hash mismatch round %d", rec.Round)
-			}
-			if decoded.PreviousBlockHash != rec.PrevHash {
-				return nil, fmt.Errorf("prev hash mismatch round %d", rec.Round)
-			}
-			blk = decoded
-		}
+	err := IterateArchiveBlocks(context.Background(), root, from, to, func(blk block.Block) error {
 		out = append(out, blk)
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }

@@ -25,8 +25,9 @@ import (
 const (
 	// PluginName is the conduit.yml importer name.
 	PluginName  = "voi_archive"
-	modeOffline = "offline"
-	modeFollow  = "follow"
+	modeOffline   = "offline"
+	modeFollow    = "follow"
+	modeBootstrap = "bootstrap" // alias of follow: historical archive then live via growing archive
 )
 
 //go:embed sample.yaml
@@ -92,10 +93,13 @@ func (imp *archiveImporter) Init(ctx context.Context, _ data.InitProvider, cfg p
 	if imp.cfg.Mode == "" {
 		imp.cfg.Mode = modeFollow
 	}
+	if imp.cfg.Mode == modeBootstrap {
+		imp.cfg.Mode = modeFollow
+	}
 	switch imp.cfg.Mode {
 	case modeOffline, modeFollow:
 	default:
-		return fmt.Errorf("voi_archive: unsupported mode %q (use offline|follow)", imp.cfg.Mode)
+		return fmt.Errorf("voi_archive: unsupported mode %q (use offline|follow|bootstrap)", imp.cfg.Mode)
 	}
 	poll, wait, err := parseDurations(imp.cfg.PollInterval, imp.cfg.WaitTimeout)
 	if err != nil {
