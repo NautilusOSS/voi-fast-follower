@@ -28,8 +28,9 @@ Voi Network (algod)
 - `GetBlock` / `WaitForBlockAfter` over standard algod v2 msgpack `BlockRaw`
 - Concurrent fetch worker pool (default **32**) with bounded `FETCH_WINDOW`
 - Strictly ordered commits; out-of-order fetches are buffered until the gap fills
-- **Batched catch-up commits** (`COMMIT_BATCH_SIZE`, default **50**) via `BatchBlockSink`
+- **Batched catch-up commits** (`COMMIT_BATCH_SIZE`, default **10**) via `BatchBlockSink`
 - Live follow forces batch size **1** for low latency
+- Postgres bulk insert: `PG_INSERT_MODE=unnest` (default) or `copy` (staging)
 - Durable checkpoint advanced atomically with each (batch) commit
 - Idempotent writes (`ON CONFLICT DO NOTHING`)
 - Live follow via `wait-for-block-after` using the same commit path
@@ -60,8 +61,10 @@ docker compose up --build
 | `VOI_START_ROUND` / `START_ROUND` | `latest` or integer round |
 | `WORKERS` | Concurrent fetch workers (default 32) |
 | `FETCH_WINDOW` | Max in-flight rounds (raised to ≥ batch size) |
-| `COMMIT_BATCH_SIZE` | Contiguous blocks per catch-up commit (default 50) |
+| `COMMIT_BATCH_SIZE` | Contiguous blocks per catch-up commit (default 10) |
 | `COMMIT_FLUSH_INTERVAL` | Partial-batch flush while catching up (default 200ms) |
+| `PG_INSERT_MODE` | `unnest` (default) or `copy` |
+| `PG_ASYNC_COMMIT` | Experimental async commit (`false` default) |
 | `DATABASE_URL` | Postgres DSN |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `METRICS_ADDR` | Metrics listen address (default `:9090`) |
@@ -119,11 +122,11 @@ See [migrations/001_initial.sql](migrations/001_initial.sql):
 docker compose up -d postgres
 export DATABASE_URL=postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
 
-# Fetch-only + COMMIT_BATCH_SIZE sweep (1/10/50/100/500) over 1000 rounds
-COUNT=1000 WORKERS=32 MODE=both ./scripts/bench.sh
+# Fetch-only + UNNEST vs COPY sink compare
+COUNT=900 WORKERS=32 MODE=sink-compare ./scripts/phase4-sink-compare.sh
 
 # Single e2e run:
-go run ./cmd/bench -mode e2e -count 1000 -workers 32 -batch 50 -reset
+go run ./cmd/bench -mode e2e -count 900 -workers 32 -batch 10 -insert-mode unnest -reset
 ```
 
 Reports start/end round, elapsed time, blocks/sec, and commit latency (avg/p50/p95).
@@ -147,12 +150,25 @@ See [docs/phase3-local-node.md](docs/phase3-local-node.md).
 
 **Conclusion:** remote e2e ~45 blk/s was acquisition-bound. Local acquisition is ~20× faster; Postgres then becomes the next limiter (~hundreds of blk/s).
 
+### Phase 4 — Postgres sink
+
+See [docs/phase4-postgres-sink.md](docs/phase4-postgres-sink.md).
+
+| Mode | Blocks/sec |
+|---|---:|
+| Local fetch-only | **~2,780** |
+| E2E UNNEST batch=10 (durable) | **~650–750** |
+| E2E COPY batch=10 | ~330–380 |
+
+**Defaults:** `PG_INSERT_MODE=unnest`, `COMMIT_BATCH_SIZE=10`. COPY staging remains available but is slower for this payload. Durable Postgres is still ~3.5–4× below local acquisition.
+
 ```bash
 docker compose up -d postgres voi-node
 # After catchup (see docs/phase3-local-node.md):
 export VOI_ALGOD_URL=http://127.0.0.1:4001
 export VOI_ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ./scripts/phase3-local.sh
+COUNT=900 ./scripts/phase4-sink-compare.sh
 ```
 
 ## Tests

@@ -12,6 +12,15 @@ import (
 // failed batch => checkpoint unchanged; success => checkpoint = final round;
 // restart resumes at checkpoint+1; duplicate retry is idempotent.
 func TestCrashRecoveryBatchSemantics(t *testing.T) {
+	for _, mode := range []string{InsertModeUNNEST, InsertModeCOPY} {
+		t.Run(mode, func(t *testing.T) {
+			testCrashRecoveryBatchSemantics(t, mode)
+		})
+	}
+}
+
+func testCrashRecoveryBatchSemantics(t *testing.T, mode string) {
+	t.Helper()
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		t.Skip("set DATABASE_URL")
@@ -22,8 +31,14 @@ func TestCrashRecoveryBatchSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sink.Close()
+	if err := sink.SetInsertMode(mode); err != nil {
+		t.Fatal(err)
+	}
 
 	base := uint64(9_400_000_000)
+	if mode == InsertModeCOPY {
+		base = 9_401_000_000
+	}
 	prevRound, prevOK, _ := sink.LastProcessedRound(ctx)
 	cleanup := func() {
 		cctx := context.Background()

@@ -2,15 +2,17 @@
 //
 // Modes:
 //
-//	fetch-only  – concurrent BlockRaw + decode, no persistence
-//	e2e         – full ingestion into Postgres (ordered commit + checkpoint)
-//	sweep       – e2e across COMMIT_BATCH_SIZE values
-//	workers     – fetch-only across worker counts (8/16/32/64)
+//	fetch-only   – concurrent BlockRaw + decode, no persistence
+//	e2e          – full ingestion into Postgres (ordered commit + checkpoint)
+//	sweep        – e2e across COMMIT_BATCH_SIZE values
+//	sink-compare – UNNEST vs COPY across batch sizes (Phase 4)
+//	workers      – fetch-only across worker counts (8/16/32/64)
 //
 // Example:
 //
 //	go run ./cmd/bench -mode fetch-only -count 1000 -workers 32
 //	go run ./cmd/bench -mode e2e -count 1000 -workers 32 -batch 50 -reset
+//	go run ./cmd/bench -mode sink-compare -count 5000 -workers 32
 //	go run ./cmd/bench -mode workers -count 1000
 package main
 
@@ -38,13 +40,15 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fetch-only", "fetch-only | e2e | sweep | workers")
+	mode := flag.String("mode", "fetch-only", "fetch-only | e2e | sweep | sink-compare | workers")
 	start := flag.Uint64("start", 0, "start round (0 = tip-count)")
 	count := flag.Uint64("count", 1000, "number of rounds to process")
 	workers := flag.Int("workers", 32, "concurrent fetch workers")
 	window := flag.Int("window", 0, "fetch window (0 = max(workers*2, batch))")
-	batch := flag.Int("batch", 50, "commit batch size (e2e)")
+	batch := flag.Int("batch", 10, "commit batch size (e2e)")
 	flush := flag.Duration("flush", 200*time.Millisecond, "commit flush interval")
+	insertMode := flag.String("insert-mode", envOr("PG_INSERT_MODE", "unnest"), "postgres insert mode: unnest | copy")
+	asyncCommit := flag.Bool("async-commit", false, "experimental: SET LOCAL synchronous_commit=off")
 	algodURL := flag.String("algod", envOr("VOI_ALGOD_URL", "https://mainnet-api.voi.nodely.dev"), "algod URL")
 	token := flag.String("token", envOr("VOI_ALGOD_TOKEN", ""), "algod token")
 	dsn := flag.String("database", envOr("DATABASE_URL", "postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable"), "postgres DSN (e2e)")
@@ -87,6 +91,8 @@ func main() {
 	fmt.Printf("end:       %d\n", endRound)
 	fmt.Printf("rounds:    %d\n", rounds)
 	fmt.Printf("workers:   %d\n", *workers)
+	fmt.Printf("insert:    %s\n", *insertMode)
+	fmt.Printf("async_cmt: %v\n", *asyncCommit)
 	fmt.Printf("tip:       %d\n", tip)
 	fmt.Printf("go:        %s/%s\n\n", runtime.GOOS, runtime.GOARCH)
 
@@ -106,16 +112,16 @@ func main() {
 				win = *batch
 			}
 		}
-		elapsed, stats, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, *batch, *flush, *reset)
+		elapsed, stats, phase, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, *batch, *flush, *insertMode, *asyncCommit, *reset)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "e2e failed: %v\n", err)
 			os.Exit(1)
 		}
-		printE2EResult(startRound, endRound, rounds, *batch, elapsed, stats)
+		printE2EResult(startRound, endRound, rounds, *batch, *insertMode, elapsed, stats, phase)
 	case "sweep":
-		batches := []int{1, 10, 50, 100}
-		fmt.Println("| Endpoint | Batch | Blocks | Elapsed | Blocks/sec | Avg Commit | p95 Commit |")
-		fmt.Println("|---|---:|---:|---:|---:|---:|---:|")
+		batches := []int{10, 50, 100, 250, 500}
+		fmt.Println("| Endpoint | Mode | Batch | Blocks | Elapsed | Blocks/sec | Avg Commit | p50 | p95 |")
+		fmt.Println("|---|---|---:|---:|---:|---:|---:|---:|---:|")
 		for _, b := range batches {
 			if err := truncateFollowerDB(ctx, *dsn, *migrations); err != nil {
 				fmt.Fprintf(os.Stderr, "truncate: %v\n", err)
@@ -128,16 +134,61 @@ func main() {
 					win = b
 				}
 			}
-			elapsed, stats, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, b, *flush, true)
+			elapsed, stats, _, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, b, *flush, *insertMode, *asyncCommit, true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "sweep failed batch=%d: %v\n", b, err)
 				os.Exit(1)
 			}
 			bps := float64(rounds) / elapsed.Seconds()
-			avg, _, p95 := stats.summary()
-			fmt.Printf("| %s | %d | %d | %s | %.2f | %s | %s |\n",
-				shortEndpoint(*algodURL), b, rounds, elapsed.Round(time.Millisecond), bps,
-				avg.Round(time.Microsecond), p95.Round(time.Microsecond))
+			avg, p50, p95 := stats.summary()
+			fmt.Printf("| %s | %s | %d | %d | %s | %.2f | %s | %s | %s |\n",
+				shortEndpoint(*algodURL), strings.ToUpper(*insertMode), b, rounds, elapsed.Round(time.Millisecond), bps,
+				avg.Round(time.Microsecond), p50.Round(time.Microsecond), p95.Round(time.Microsecond))
+		}
+	case "sink-compare":
+		modes := []string{storage.InsertModeUNNEST, storage.InsertModeCOPY}
+		batches := []int{10, 50, 100, 250, 500}
+		// Disable time-based partial flush so batch size is the controlled variable.
+		compareFlush := *flush
+		if compareFlush < time.Minute {
+			compareFlush = time.Hour
+		}
+		fmt.Printf("flush:     %s (full batches for fair compare)\n\n", compareFlush)
+		fmt.Println("| Implementation | Batch | Blocks | Elapsed | Blocks/sec | Avg Commit | p50 | p95 | Write avg | Commit-phase avg |")
+		fmt.Println("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+		for _, im := range modes {
+			for _, b := range batches {
+				if err := truncateFollowerDB(ctx, *dsn, *migrations); err != nil {
+					fmt.Fprintf(os.Stderr, "truncate: %v\n", err)
+					os.Exit(1)
+				}
+				win := *window
+				if win < 1 {
+					win = *workers * 2
+					if win < b {
+						win = b
+					}
+				}
+				var ms runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&ms)
+				heapBefore := ms.Alloc
+
+				elapsed, stats, phase, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, b, compareFlush, im, *asyncCommit, true)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "sink-compare failed mode=%s batch=%d: %v\n", im, b, err)
+					os.Exit(1)
+				}
+				runtime.ReadMemStats(&ms)
+				bps := float64(rounds) / elapsed.Seconds()
+				avg, p50, p95 := stats.summary()
+				fmt.Printf("| %s | %d | %d | %s | %.2f | %s | %s | %s | %s | %s |\n",
+					strings.ToUpper(im), b, rounds, elapsed.Round(time.Millisecond), bps,
+					avg.Round(time.Microsecond), p50.Round(time.Microsecond), p95.Round(time.Microsecond),
+					phase.writeAvg.Round(time.Microsecond), phase.commitAvg.Round(time.Microsecond))
+				_ = heapBefore
+				fmt.Fprintf(os.Stderr, "# heap_delta_%s_b%d ≈ %d KiB\n", im, b, int64(ms.Alloc-heapBefore)/1024)
+			}
 		}
 	case "workers":
 		counts := []int{8, 16, 32, 64}
@@ -255,25 +306,44 @@ func (t *timingSink) BlockHash(ctx context.Context, round uint64) (string, bool,
 }
 func (t *timingSink) Close() error { return t.inner.Close() }
 
-func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, dsn, migrations string, from, to uint64, workers, window, batch int, flush time.Duration, reset bool) (time.Duration, *latencyStats, error) {
+type phaseAgg struct {
+	writeAvg  time.Duration
+	commitAvg time.Duration
+	n         int
+}
+
+func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, dsn, migrations string, from, to uint64, workers, window, batch int, flush time.Duration, insertMode string, asyncCommit, reset bool) (time.Duration, *latencyStats, phaseAgg, error) {
+	var phase phaseAgg
 	sink, err := storage.NewPostgres(ctx, dsn, migrations)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, phase, err
 	}
 	defer sink.Close()
+	if err := sink.SetInsertMode(insertMode); err != nil {
+		return 0, nil, phase, err
+	}
+	sink.SetAsyncCommit(asyncCommit)
+
+	var writeSum, commitSum time.Duration
+	var phaseN int
+	sink.OnTimings(func(t storage.CommitPhaseTimings) {
+		writeSum += t.Writes
+		commitSum += t.Commit
+		phaseN++
+	})
 
 	if reset {
 		if _, err := sink.Pool().Exec(ctx, `DELETE FROM transactions WHERE round >= $1 AND round <= $2`, from, to); err != nil {
-			return 0, nil, err
+			return 0, nil, phase, err
 		}
 		if _, err := sink.Pool().Exec(ctx, `DELETE FROM blocks WHERE round >= $1 AND round <= $2`, from, to); err != nil {
-			return 0, nil, err
+			return 0, nil, phase, err
 		}
 		if _, err := sink.Pool().Exec(ctx, `
 			INSERT INTO sync_state(key, value) VALUES ('last_processed_round', $1)
 			ON CONFLICT (key) DO UPDATE SET value = $1
 		`, int64(from-1)); err != nil {
-			return 0, nil, err
+			return 0, nil, phase, err
 		}
 	}
 
@@ -299,17 +369,22 @@ func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, dsn, mi
 	start := time.Now()
 	err = engine.Run(ctx)
 	elapsed := time.Since(start)
+	if phaseN > 0 {
+		phase.writeAvg = writeSum / time.Duration(phaseN)
+		phase.commitAvg = commitSum / time.Duration(phaseN)
+		phase.n = phaseN
+	}
 	if err != nil {
-		return elapsed, stats, err
+		return elapsed, stats, phase, err
 	}
 	last, ok, err := sink.LastProcessedRound(ctx)
 	if err != nil {
-		return elapsed, stats, err
+		return elapsed, stats, phase, err
 	}
 	if !ok || last < to {
-		return elapsed, stats, fmt.Errorf("checkpoint=%d ok=%v want >= %d", last, ok, to)
+		return elapsed, stats, phase, fmt.Errorf("checkpoint=%d ok=%v want >= %d", last, ok, to)
 	}
-	return elapsed, stats, nil
+	return elapsed, stats, phase, nil
 }
 
 func printFetchResult(start, end, rounds uint64, workers int, elapsed time.Duration, stats *latencyStats, errs uint64) {
@@ -328,7 +403,7 @@ func printFetchResult(start, end, rounds uint64, workers int, elapsed time.Durat
 	fmt.Printf("errors:          %d\n", errs)
 }
 
-func printE2EResult(start, end, rounds uint64, batch int, elapsed time.Duration, stats *latencyStats) {
+func printE2EResult(start, end, rounds uint64, batch int, insertMode string, elapsed time.Duration, stats *latencyStats, phase phaseAgg) {
 	bps := float64(rounds) / elapsed.Seconds()
 	avg, p50, p95 := stats.summary()
 	fmt.Println("=== Results ===")
@@ -336,12 +411,17 @@ func printE2EResult(start, end, rounds uint64, batch int, elapsed time.Duration,
 	fmt.Printf("end_round:       %d\n", end)
 	fmt.Printf("rounds:          %d\n", rounds)
 	fmt.Printf("batch_size:      %d\n", batch)
+	fmt.Printf("insert_mode:     %s\n", insertMode)
 	fmt.Printf("elapsed:         %s\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("blocks_per_sec:  %.2f\n", bps)
 	fmt.Printf("commit_avg:      %s\n", avg.Round(time.Microsecond))
 	fmt.Printf("commit_p50:      %s\n", p50.Round(time.Microsecond))
 	fmt.Printf("commit_p95:      %s\n", p95.Round(time.Microsecond))
 	fmt.Printf("commit_samples:  %d\n", len(stats.durs))
+	if phase.n > 0 {
+		fmt.Printf("write_avg:       %s\n", phase.writeAvg.Round(time.Microsecond))
+		fmt.Printf("pg_commit_avg:   %s\n", phase.commitAvg.Round(time.Microsecond))
+	}
 }
 
 func truncateFollowerDB(ctx context.Context, dsn, migrations string) error {

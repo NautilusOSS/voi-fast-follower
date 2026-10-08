@@ -51,6 +51,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer sink.Close()
+	if err := sink.SetInsertMode(cfg.Database.InsertMode); err != nil {
+		log.Error("postgres insert mode", "err", err)
+		os.Exit(1)
+	}
+	sink.SetAsyncCommit(cfg.Database.AsyncCommit)
+	if cfg.Database.AsyncCommit {
+		log.Warn("experimental PG async commit enabled; durability is reduced")
+	}
+	log.Info("postgres sink ready", "insert_mode", sink.InsertMode(), "async_commit", cfg.Database.AsyncCommit)
 
 	m := metrics.Default()
 	mux := http.NewServeMux()

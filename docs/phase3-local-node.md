@@ -105,7 +105,7 @@ With local algod, persistence becomes the next limiter (fetch 2k+ vs e2e peak ~5
 
 Optimize the Postgres sink path while keeping durability:
 
-1. `COPY` / staging temp tables for block + tx inserts  
+1. ~~`COPY` / staging temp tables~~ — done in Phase 4; UNNEST batch=10 won (~650–750 blk/s). See [phase4-postgres-sink.md](phase4-postgres-sink.md). 
 2. Reduce per-batch SQL round-trips further  
 3. Measure commit fsync vs statement time  
 4. Keep ordered, gap-free, atomic checkpoint semantics  

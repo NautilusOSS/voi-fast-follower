@@ -36,7 +36,7 @@ type SyncConfig struct {
 	// FetchWindow bounds in-flight (fetched-but-not-committed) rounds.
 	FetchWindow int `yaml:"fetch_window"`
 	// CommitBatchSize is the max contiguous blocks per sink commit during
-	// catch-up. Live follow forces batch size 1. Default 100.
+	// catch-up. Live follow forces batch size 1. Default 10.
 	CommitBatchSize int `yaml:"commit_batch_size"`
 	// CommitFlushInterval flushes a partial catch-up batch after this delay
 	// waiting for more contiguous rounds (0 disables time-based flush).
@@ -49,6 +49,11 @@ type SyncConfig struct {
 
 type DatabaseConfig struct {
 	URL string `yaml:"url"`
+	// InsertMode is "unnest" (default) or "copy" for Postgres CommitBatch.
+	InsertMode string `yaml:"insert_mode"`
+	// AsyncCommit is an experimental opt-in that sets synchronous_commit=off
+	// for batch transactions only. Disabled by default.
+	AsyncCommit bool `yaml:"async_commit"`
 }
 
 type MetricsConfig struct {
@@ -98,7 +103,8 @@ func defaults() *Config {
 			CommitFlushInterval: 200 * time.Millisecond,
 		},
 		Database: DatabaseConfig{
-			URL: "",
+			URL:        "",
+			InsertMode: "unnest",
 		},
 		Metrics: MetricsConfig{
 			Addr: ":9090",
@@ -127,6 +133,12 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("DATABASE_URL"); v != "" {
 		cfg.Database.URL = v
+	}
+	if v := os.Getenv("PG_INSERT_MODE"); v != "" {
+		cfg.Database.InsertMode = v
+	}
+	if v := os.Getenv("PG_ASYNC_COMMIT"); v != "" {
+		cfg.Database.AsyncCommit = strings.EqualFold(v, "1") || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
 	}
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -207,8 +219,8 @@ func (c *Config) Validate() error {
 		c.Sync.FetchWindow = c.Sync.Workers
 	}
 	if c.Sync.CommitBatchSize < 1 {
-		// Benchmarked sweet spot on mainnet catch-up; see README Phase 2.
-		c.Sync.CommitBatchSize = 50
+		// Phase 4 local e2e sweet spot (UNNEST); see docs/phase4-postgres-sink.md.
+		c.Sync.CommitBatchSize = 10
 	}
 	// Keep the fetch window large enough to fill a commit batch.
 	if c.Sync.FetchWindow < c.Sync.CommitBatchSize {
@@ -225,6 +237,14 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Log.Level) == "" {
 		c.Log.Level = "info"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Database.InsertMode)) {
+	case "", "unnest":
+		c.Database.InsertMode = "unnest"
+	case "copy":
+		c.Database.InsertMode = "copy"
+	default:
+		return fmt.Errorf("database.insert_mode must be copy or unnest, got %q", c.Database.InsertMode)
 	}
 	sr := strings.TrimSpace(c.Sync.StartRound)
 	if sr == "" {

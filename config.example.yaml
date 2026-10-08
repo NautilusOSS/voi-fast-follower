@@ -11,11 +11,15 @@ sync:
   poll_interval: 100ms
   workers: 32
   fetch_window: 128
-  commit_batch_size: 50
+  commit_batch_size: 10
   commit_flush_interval: 200ms
 
 database:
   url: postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable
+  # Bulk insert strategy: unnest (default; Phase 4 winner) or copy
+  insert_mode: unnest
+  # Experimental only — never enable in production
+  async_commit: false
 
 metrics:
   addr: ":9090"
