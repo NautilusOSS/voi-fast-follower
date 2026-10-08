@@ -5,6 +5,8 @@ ARCHIVE_PATH="${ARCHIVE_PATH:-/var/lib/voi-fast-follower/archive}"
 mkdir -p "$ARCHIVE_PATH"
 if [ "$(id -u)" = "0" ]; then
   chown -R follower:follower /var/lib/voi-fast-follower 2>/dev/null || true
+  # Also fix the configured archive path (may be a bind mount at /data/archive).
+  chown -R follower:follower "$ARCHIVE_PATH" 2>/dev/null || true
   exec su-exec follower /app/follower "$@"
 fi
 exec /app/follower "$@"

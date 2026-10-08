@@ -161,7 +161,10 @@ func readCheckpointFile(path string) (uint64, bool, error) {
 	if len(b) == 0 {
 		return 0, false, nil
 	}
-	if len(b) == 8 {
+	// Current format is decimal text. Legacy LE uint64 is only used when the
+	// 8-byte payload is not entirely ASCII digits (e.g. "23371392" must parse
+	// as decimal, not as a binary integer).
+	if len(b) == 8 && !isAllASCIIDigits(b) {
 		return binary.LittleEndian.Uint64(b), true, nil
 	}
 	n, err := strconv.ParseUint(string(b), 10, 64)
@@ -169,6 +172,15 @@ func readCheckpointFile(path string) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("parse checkpoint: %w", err)
 	}
 	return n, true, nil
+}
+
+func isAllASCIIDigits(b []byte) bool {
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ArchiveSink) writeCheckpoint(round uint64) error {
