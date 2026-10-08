@@ -44,16 +44,44 @@ Full text: [docs/stream-contract.md](docs/stream-contract.md) · Phase 6: [docs/
 - **Restart:** `resume = checkpoint + 1`
 - **Failure:** sink error blocks checkpoint advance past the failed batch
 
-### Integrate as a consumer
+### How do I consume it?
 
-Implement `storage.BlockSink` / `BatchBlockSink` and attach via `BuildSinks` or `MultiSink`. Do not depend on fetch workers or buffer internals.
+External applications read the **durable archive** (or follow it while the follower runs). Use the reference consumer or `pkg/consumer` — not follower internals.
 
 ```bash
+# start Voi + follower (production-style)
+cp .env.example .env   # set POSTGRES_PASSWORD, VOI_ALGOD_URL, token
+docker compose -f docker-compose.prod.yml up -d
+
+# verify archive
 go run ./cmd/verify -archive ./archive
 go run ./cmd/archive-info -archive ./archive
-curl -s localhost:9090/healthz | jq .
-curl -s localhost:9090/readyz | jq .
+
+# inspect health
+curl -s http://127.0.0.1:9090/healthz | jq .
+curl -s http://127.0.0.1:9090/readyz | jq .
+
+# consume historical range (no Voi network contact)
+go run ./examples/block-consumer \
+  --archive ./archive --start 1000000 --end 1000100 \
+  --checkpoint ./consumer.cp
+
+# follow growing archive (follower still acquiring)
+go run ./examples/block-consumer \
+  --archive ./archive --follow --checkpoint ./consumer.cp
+
+# historical → live after archive tip
+go run ./examples/block-consumer \
+  --archive ./archive --follow \
+  --algod http://127.0.0.1:4001 --token "$VOI_ALGOD_TOKEN" \
+  --checkpoint ./consumer.cp
 ```
+
+Consumer checkpoint files are **independent** from the follower checkpoint. A consumer may lag thousands of rounds; the follower never rewinds. See [docs/phase10-ecosystem-validation.md](docs/phase10-ecosystem-validation.md).
+
+### Integrate as an in-process sink
+
+Implement `storage.BlockSink` / `BatchBlockSink` and attach via `BuildSinks` or `MultiSink`. Do not depend on fetch workers or buffer internals.
 
 ## Features
 
@@ -281,6 +309,21 @@ go run ./cmd/verify -archive ./archive
 go run ./cmd/archive-prune -archive ./archive -keep-rounds 500000
 ```
 
+### Phase 10 — Reference consumer & ecosystem validation
+
+See [docs/phase10-ecosystem-validation.md](docs/phase10-ecosystem-validation.md).
+
+```bash
+# Offline ecosystem check (archive must exist)
+ARCHIVE_PATH=./archive START=1 END=100 ./scripts/phase10-ecosystem.sh
+
+# Public consumer API (experimental)
+go doc github.com/NautilusOSS/voi-fast-follower/pkg/consumer
+
+# Integration tests
+go test ./pkg/consumer/... -v -count=1
+```
+
 ```bash
 docker compose up -d postgres voi-node
 # After catchup (see docs/phase3-local-node.md):
@@ -318,6 +361,8 @@ cmd/bootstrap/main.go     # archive → live handoff → sink
 cmd/verify/main.go        # archive integrity
 cmd/archive-info/main.go  # archive metadata
 cmd/archive-export|import|compare|prune/
+examples/block-consumer/   # reference external consumer (pkg/consumer only)
+pkg/consumer/              # experimental public consumer API
 internal/config/
 internal/voi/             # GetBlock, WaitForBlockAfter
 internal/block/           # canonical Block + msgpack decode
@@ -333,11 +378,13 @@ docs/stream-contract.md
 docs/phase7-conduit-adapter.md
 docs/phase8-bootstrap-history.md
 docs/phase9-production.md
+docs/phase10-ecosystem-validation.md
 deploy/docker-entrypoint.sh
 docker-compose.prod.yml
 scripts/phase5-pipelines.sh
 scripts/phase7-demo.sh
 scripts/phase9-*.sh
+scripts/phase10-ecosystem.sh
 ```
 
 ## Research notes (Phase 1)

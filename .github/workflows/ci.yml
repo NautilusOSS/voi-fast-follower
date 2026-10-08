@@ -30,7 +30,8 @@ jobs:
           go build -o bin/follower ./cmd/follower
           go build -o /dev/null ./cmd/replay ./cmd/verify ./cmd/archive-info \
             ./cmd/archive-export ./cmd/archive-import ./cmd/archive-compare \
-            ./cmd/archive-prune ./cmd/bootstrap ./cmd/bench
+            ./cmd/archive-prune ./cmd/bootstrap ./cmd/bench \
+            ./examples/block-consumer
 
       - name: Build Conduit plugin (optional module)
         working-directory: plugins/conduit

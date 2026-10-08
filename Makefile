@@ -12,6 +12,7 @@ build:
 	go build -o bin/replay ./cmd/replay
 	go build -o bin/verify ./cmd/verify
 	go build -o bin/bootstrap ./cmd/bootstrap
+	go build -o bin/block-consumer ./examples/block-consumer
 
 conduit:
 	cd plugins/conduit && go build -o ../../bin/conduit ./cmd/conduit

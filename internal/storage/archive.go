@@ -131,6 +131,24 @@ func (s *ArchiveSink) loadCheckpoint() error {
 	return nil
 }
 
+// refreshCheckpointLocked reloads the durable checkpoint from disk when another
+// process (e.g. the follower) appends to the archive. Safe for read-only consumers.
+func (s *ArchiveSink) refreshCheckpointLocked() error {
+	cp, ok, err := readCheckpointFile(s.checkpointPath())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if s.hasCP && cp <= s.checkpoint {
+		return nil
+	}
+	s.hasCP = true
+	s.checkpoint = cp
+	return s.rebuildIndexLocked()
+}
+
 func readCheckpointFile(path string) (uint64, bool, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -506,6 +524,9 @@ func (s *ArchiveSink) openSegmentForAppend(path string, start uint64) (*os.File,
 func (s *ArchiveSink) LastProcessedRound(ctx context.Context) (uint64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refreshCheckpointLocked(); err != nil {
+		return 0, false, err
+	}
 	if !s.hasCP {
 		return 0, false, nil
 	}
@@ -539,6 +560,11 @@ func (s *ArchiveSink) BlockHash(ctx context.Context, round uint64) (string, bool
 func (s *ArchiveSink) GetBlock(ctx context.Context, round uint64) (block.Block, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.hasCP || round > s.checkpoint {
+		if err := s.refreshCheckpointLocked(); err != nil {
+			return block.Block{}, false, err
+		}
+	}
 	if !s.hasCP || round > s.checkpoint {
 		return block.Block{}, false, nil
 	}
