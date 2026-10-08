@@ -38,14 +38,16 @@ type Metrics struct {
 	InFlight           prometheus.Gauge
 	OrderedBufferDepth prometheus.Gauge
 	AwaitingCommit     prometheus.Gauge
+	ArchiveBytes       prometheus.Counter
+	ArchiveErrors      prometheus.Counter
 
-	processed    atomic.Uint64
-	fetched      atomic.Uint64
-	windowStart  atomic.Int64
-	windowCount  atomic.Uint64
+	processed     atomic.Uint64
+	fetched       atomic.Uint64
+	windowStart   atomic.Int64
+	windowCount   atomic.Uint64
 	fetchWinStart atomic.Int64
 	fetchWinCount atomic.Uint64
-	busy         atomic.Int64
+	busy          atomic.Int64
 }
 
 var (
@@ -140,6 +142,14 @@ func New() *Metrics {
 			Name: "voi_follower_awaiting_commit",
 			Help: "Contiguous ready rounds waiting to be flushed to the sink",
 		}),
+		ArchiveBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "voi_follower_archive_bytes_written_total",
+			Help: "Total bytes appended to the archive sink",
+		}),
+		ArchiveErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "voi_follower_archive_errors_total",
+			Help: "Archive sink errors",
+		}),
 	}
 	reg.MustRegister(
 		m.CurrentRound,
@@ -160,6 +170,8 @@ func New() *Metrics {
 		m.InFlight,
 		m.OrderedBufferDepth,
 		m.AwaitingCommit,
+		m.ArchiveBytes,
+		m.ArchiveErrors,
 	)
 	now := time.Now().UnixNano()
 	m.windowStart.Store(now)
@@ -262,6 +274,18 @@ func (m *Metrics) RecordBlock() {
 // RecordError increments the error counter.
 func (m *Metrics) RecordError() {
 	m.Errors.Inc()
+}
+
+// RecordArchiveBytes increments archive bytes written.
+func (m *Metrics) RecordArchiveBytes(n int) {
+	if n > 0 {
+		m.ArchiveBytes.Add(float64(n))
+	}
+}
+
+// RecordArchiveError increments archive error counter.
+func (m *Metrics) RecordArchiveError() {
+	m.ArchiveErrors.Inc()
 }
 
 // ProcessedTotal returns the number of blocks recorded in-process.

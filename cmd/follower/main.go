@@ -45,23 +45,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	sink, err := storage.NewPostgres(ctx, cfg.Database.URL, *migrationsPath)
+	pgURL := ""
+	if cfg.PostgresEnabled() {
+		pgURL = cfg.Database.URL
+	}
+	archPath := ""
+	if cfg.ArchiveEnabled() {
+		archPath = cfg.Archive.Path
+	}
+	bundle, err := storage.BuildSinks(ctx, storage.BuildOptions{
+		PostgresURL:        pgURL,
+		PostgresMigrations: *migrationsPath,
+		PostgresInsertMode: cfg.Database.InsertMode,
+		PostgresAsync:      cfg.Database.AsyncCommit,
+		ArchivePath:        archPath,
+		ArchiveSegmentSize: cfg.Archive.SegmentSize,
+	})
 	if err != nil {
-		log.Error("postgres error", "err", err)
+		log.Error("sink setup error", "err", err)
 		os.Exit(1)
 	}
-	defer sink.Close()
-	if err := sink.SetInsertMode(cfg.Database.InsertMode); err != nil {
-		log.Error("postgres insert mode", "err", err)
-		os.Exit(1)
-	}
-	sink.SetAsyncCommit(cfg.Database.AsyncCommit)
+	defer bundle.Close()
 	if cfg.Database.AsyncCommit {
 		log.Warn("experimental PG async commit enabled; durability is reduced")
 	}
-	log.Info("postgres sink ready", "insert_mode", sink.InsertMode(), "async_commit", cfg.Database.AsyncCommit)
+	log.Info("sinks ready", "sinks", strings.Join(bundle.Names, "+"))
 
 	m := metrics.Default()
+	if bundle.Archive != nil {
+		bundle.Archive.OnBytes(func(n int) { m.RecordArchiveBytes(n) })
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -69,9 +83,13 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	apiServer := &api.Server{DB: sink, Voi: client}
-	apiServer.Register(mux)
-	mountExplorer(mux, *webPath, log)
+	if bundle.Postgres != nil {
+		apiServer := &api.Server{DB: bundle.Postgres, Voi: client}
+		apiServer.Register(mux)
+		mountExplorer(mux, *webPath, log)
+	} else {
+		log.Info("postgres sink disabled; explorer API unavailable")
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Metrics.Addr,
@@ -79,13 +97,13 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Info("http listening", "addr", cfg.Metrics.Addr, "explorer", "/")
+		log.Info("http listening", "addr", cfg.Metrics.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http server error", "err", err)
 		}
 	}()
 
-	engine := follower.New(cfg, client, sink, m, log)
+	engine := follower.New(cfg, client, bundle.Primary, m, log)
 	err = engine.Run(ctx)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

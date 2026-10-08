@@ -7,13 +7,15 @@ import (
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
 )
 
-// BlockSink is the storage abstraction for ingested blocks.
+// BlockSink is the persistence/delivery abstraction for the canonical Block stream.
 //
-// Synchronization (fetch/order) stays outside this interface so future
-// consumers can swap Postgres for Conduit, Kafka, object storage, etc.
+// Synchronization (fetch/order/validation) stays in the follower. Sinks only
+// persist or forward already-validated contiguous blocks. Postgres and the
+// local archive are first-party sinks; a future Conduit adapter can implement
+// the same interface.
 //
 // Implementations MUST tolerate at-least-once delivery (idempotent writes).
-// Commit MUST atomically persist the block data and advance last_processed_round.
+// Commit MUST durably persist the block data and advance last_processed_round.
 type BlockSink interface {
 	// Commit persists blk and advances the checkpoint to blk.Round.
 	// It must be safe to call again with the same round (idempotent).

@@ -11,7 +11,8 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"VOI_ALGOD_URL", "VOI_ALGOD_TOKEN", "VOI_START_ROUND", "START_ROUND", "VOI_SYNC_MODE",
-		"DATABASE_URL", "PG_INSERT_MODE", "PG_ASYNC_COMMIT",
+		"DATABASE_URL", "PG_ENABLED", "PG_INSERT_MODE", "PG_ASYNC_COMMIT",
+		"ARCHIVE_PATH", "ARCHIVE_ENABLED", "ARCHIVE_SEGMENT_SIZE",
 		"POLL_INTERVAL", "WORKERS", "FETCH_WINDOW",
 		"COMMIT_BATCH_SIZE", "COMMIT_FLUSH_INTERVAL",
 		"PREFETCH_WORKERS", "PREFETCH_BUFFER",
@@ -160,6 +161,21 @@ func TestExplicitStartRound(t *testing.T) {
 	n, ok, err := cfg.ExplicitStartRound()
 	if err != nil || !ok || n != 25000000 {
 		t.Fatalf("got %d ok=%v err=%v", n, ok, err)
+	}
+}
+
+func TestArchiveOnlyConfig(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := defaults()
+	cfg.Node.AlgodURL = "http://x"
+	cfg.Database.URL = ""
+	cfg.Archive.Enabled = true
+	cfg.Archive.Path = "/tmp/arch"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PostgresEnabled() || !cfg.ArchiveEnabled() {
+		t.Fatalf("pg=%v arch=%v", cfg.PostgresEnabled(), cfg.ArchiveEnabled())
 	}
 }
 

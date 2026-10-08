@@ -21,6 +21,12 @@ database:
   # Experimental only — never enable in production
   async_commit: false
 
+# Local segment archive (optional; can run alongside Postgres)
+archive:
+  enabled: false
+  path: ./archive
+  segment_size: 1000
+
 metrics:
   addr: ":9090"
 

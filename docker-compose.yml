@@ -63,9 +63,14 @@ services:
       COMMIT_FLUSH_INTERVAL: ${COMMIT_FLUSH_INTERVAL:-200ms}
       PG_INSERT_MODE: ${PG_INSERT_MODE:-unnest}
       PG_ASYNC_COMMIT: ${PG_ASYNC_COMMIT:-false}
+      ARCHIVE_ENABLED: ${ARCHIVE_ENABLED:-false}
+      ARCHIVE_PATH: ${ARCHIVE_PATH:-/data/archive}
+      ARCHIVE_SEGMENT_SIZE: ${ARCHIVE_SEGMENT_SIZE:-1000}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       METRICS_ADDR: ":9090"
       MIGRATIONS_PATH: /app/migrations
+    volumes:
+      - follower-archive:/data/archive
     ports:
       - "9090:9090"
     restart: unless-stopped
@@ -73,3 +78,4 @@ services:
 volumes:
   postgres-data:
   voi-algod-data:
+  follower-archive:

@@ -13,13 +13,19 @@ Voi Network (algod)
  concurrent BlockRaw fetches  (worker pool)
         │
         ▼
- ordered commit               (gap-free)
+ validation + ordered buffer  (gap-free)
         │
         ▼
- durable checkpoint           (last_processed_round)
+ canonical Block stream       (raw msgpack preserved)
         │
-        ▼
- PostgresBlockSink  ←── BlockSink interface (future: Kafka, NATS, Conduit, …)
+        ├──────────────┬──────────────┐
+        ▼              ▼              ▼
+   PostgresSink   ArchiveSink    MultiSink
+        │              │              │
+        └──────────────┴──────────────┘
+                       ▼
+              durable checkpoint
+         (min across required sinks)
 ```
 
 ## Features (Phase 1)
@@ -31,11 +37,13 @@ Voi Network (algod)
 - **Batched catch-up commits** (`COMMIT_BATCH_SIZE`, default **10**) via `BatchBlockSink`
 - Live follow forces batch size **1** for low latency
 - Postgres bulk insert: `PG_INSERT_MODE=unnest` (default) or `copy` (staging)
-- Durable checkpoint advanced atomically with each (batch) commit
-- Idempotent writes (`ON CONFLICT DO NOTHING`)
+- Optional **local segment archive** sink (`ARCHIVE_PATH`) and multi-sink fan-out
+- Durable checkpoint advanced only after all required sinks accept the batch
+- Idempotent writes; archive crash reconcile via checkpoint file
+- Offline **replay** from archive → any sink (`cmd/replay`)
 - Live follow via `wait-for-block-after` using the same commit path
 - Prometheus metrics on `:9090/metrics`
-- Docker Compose: `follower` + `postgres`
+- Docker Compose: `follower` + `postgres` (+ optional archive volume)
 
 ### Correctness invariant
 
@@ -65,7 +73,9 @@ docker compose up --build
 | `COMMIT_FLUSH_INTERVAL` | Partial-batch flush while catching up (default 200ms) |
 | `PG_INSERT_MODE` | `unnest` (default) or `copy` |
 | `PG_ASYNC_COMMIT` | Experimental async commit (`false` default) |
-| `DATABASE_URL` | Postgres DSN |
+| `DATABASE_URL` | Postgres DSN (optional if archive-only) |
+| `ARCHIVE_PATH` / `ARCHIVE_ENABLED` | Local segment archive sink |
+| `ARCHIVE_SEGMENT_SIZE` | Rounds per `.seg` (default 1000) |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `METRICS_ADDR` | Metrics listen address (default `:9090`) |
 
@@ -162,6 +172,28 @@ See [docs/phase4-postgres-sink.md](docs/phase4-postgres-sink.md).
 
 **Defaults:** `PG_INSERT_MODE=unnest`, `COMMIT_BATCH_SIZE=10`. COPY staging remains available but is slower for this payload. Durable Postgres is still ~3.5–4× below local acquisition.
 
+### Phase 5 — block stream + archive
+
+See [docs/phase5-block-stream-archive.md](docs/phase5-block-stream-archive.md).
+
+| Pipeline | Blocks/sec |
+|---|---:|
+| Fetch only | ~2,000–2,780 |
+| PostgreSQL | ~270–750 |
+| Archive (fsync) | ~350 |
+| Archive + PostgreSQL | ~240 |
+
+```bash
+# Capture to archive + Postgres
+ARCHIVE_ENABLED=true ARCHIVE_PATH=./archive docker compose up --build
+
+# Offline replay (no Voi contact)
+go run ./cmd/replay -archive ./archive -start N -end M -sink postgres -database "$DATABASE_URL"
+
+# Pipeline bake-off
+COUNT=900 ./scripts/phase5-pipelines.sh
+```
+
 ```bash
 docker compose up -d postgres voi-node
 # After catchup (see docs/phase3-local-node.md):
@@ -191,14 +223,16 @@ Follower unit tests cover sequential ingestion, out-of-order fetch, ordered comm
 ```text
 cmd/follower/main.go
 cmd/bench/main.go
+cmd/replay/main.go     # archive → sink (offline)
 internal/config/
 internal/voi/          # GetBlock, WaitForBlockAfter
-internal/block/        # msgpack decode + hash
-internal/follower/     # worker pool + ordered commit
-internal/storage/      # BlockSink + PostgresBlockSink
+internal/block/        # canonical Block + msgpack decode
+internal/follower/     # worker pool + ordered stream
+internal/storage/      # BlockSink, Postgres, Archive, MultiSink
 internal/metrics/
 migrations/
 scripts/bench.sh
+scripts/phase5-pipelines.sh
 ```
 
 ## Research notes (Phase 1)

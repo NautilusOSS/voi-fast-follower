@@ -16,7 +16,9 @@ import (
 // go-codec Handles are not safe for concurrent Encode/Decode.
 var msgpackMu sync.Mutex
 
-// Block is a sink-agnostic representation of a Voi/Algorand block.
+// Block is the canonical, sink-agnostic representation of a fetched Voi block.
+// The follower emits an ordered stream of Block values; sinks persist or forward
+// them. Raw always retains the original algod msgpack BlockRaw bytes.
 type Block struct {
 	Round             uint64
 	BlockHash         string
@@ -92,6 +94,18 @@ func hashBlockHeaderLocked(hdr types.BlockHeader) string {
 
 func digestBase32(d types.Digest) string {
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(d[:])
+}
+
+// ValidateLinkage checks that blk.PreviousBlockHash matches the prior block hash.
+func ValidateLinkage(prevHash string, blk Block) error {
+	if prevHash == "" {
+		return nil
+	}
+	if blk.PreviousBlockHash != prevHash {
+		return fmt.Errorf("hash linkage broken: prev=%s block.prev=%s round=%d",
+			prevHash, blk.PreviousBlockHash, blk.Round)
+	}
+	return nil
 }
 
 // AppIDFromRaw returns the application id from a stored SignedTxnInBlock msgpack blob.

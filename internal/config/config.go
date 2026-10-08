@@ -18,6 +18,7 @@ type Config struct {
 	Node     NodeConfig     `yaml:"node"`
 	Sync     SyncConfig     `yaml:"sync"`
 	Database DatabaseConfig `yaml:"database"`
+	Archive  ArchiveConfig  `yaml:"archive"`
 	Metrics  MetricsConfig  `yaml:"metrics"`
 	Log      LogConfig      `yaml:"log"`
 }
@@ -48,12 +49,21 @@ type SyncConfig struct {
 }
 
 type DatabaseConfig struct {
-	URL string `yaml:"url"`
+	// Enabled defaults to true when URL is non-empty.
+	Enabled *bool  `yaml:"enabled"`
+	URL     string `yaml:"url"`
 	// InsertMode is "unnest" (default) or "copy" for Postgres CommitBatch.
 	InsertMode string `yaml:"insert_mode"`
 	// AsyncCommit is an experimental opt-in that sets synchronous_commit=off
 	// for batch transactions only. Disabled by default.
 	AsyncCommit bool `yaml:"async_commit"`
+}
+
+// ArchiveConfig configures the local segment archive sink.
+type ArchiveConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Path        string `yaml:"path"`
+	SegmentSize int    `yaml:"segment_size"`
 }
 
 type MetricsConfig struct {
@@ -106,6 +116,11 @@ func defaults() *Config {
 			URL:        "",
 			InsertMode: "unnest",
 		},
+		Archive: ArchiveConfig{
+			Enabled:     false,
+			Path:        "",
+			SegmentSize: 1000,
+		},
 		Metrics: MetricsConfig{
 			Addr: ":9090",
 		},
@@ -134,11 +149,27 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("DATABASE_URL"); v != "" {
 		cfg.Database.URL = v
 	}
+	if v := os.Getenv("PG_ENABLED"); v != "" {
+		on := strings.EqualFold(v, "1") || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+		cfg.Database.Enabled = &on
+	}
 	if v := os.Getenv("PG_INSERT_MODE"); v != "" {
 		cfg.Database.InsertMode = v
 	}
 	if v := os.Getenv("PG_ASYNC_COMMIT"); v != "" {
 		cfg.Database.AsyncCommit = strings.EqualFold(v, "1") || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+	}
+	if v := os.Getenv("ARCHIVE_PATH"); v != "" {
+		cfg.Archive.Path = v
+		cfg.Archive.Enabled = true
+	}
+	if v := os.Getenv("ARCHIVE_ENABLED"); v != "" {
+		cfg.Archive.Enabled = strings.EqualFold(v, "1") || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+	}
+	if v := os.Getenv("ARCHIVE_SEGMENT_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Archive.SegmentSize = n
+		}
 	}
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -187,13 +218,29 @@ func applyEnv(cfg *Config) {
 	}
 }
 
+// PostgresEnabled reports whether the Postgres sink should be constructed.
+func (c *Config) PostgresEnabled() bool {
+	if c.Database.Enabled != nil {
+		return *c.Database.Enabled && strings.TrimSpace(c.Database.URL) != ""
+	}
+	return strings.TrimSpace(c.Database.URL) != ""
+}
+
+// ArchiveEnabled reports whether the archive sink should be constructed.
+func (c *Config) ArchiveEnabled() bool {
+	return c.Archive.Enabled && strings.TrimSpace(c.Archive.Path) != ""
+}
+
 // Validate checks required fields and normalizes sync settings.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Node.AlgodURL) == "" {
 		return fmt.Errorf("node.algod_url / VOI_ALGOD_URL is required")
 	}
-	if strings.TrimSpace(c.Database.URL) == "" {
-		return fmt.Errorf("database.url / DATABASE_URL is required")
+	if c.Archive.SegmentSize < 1 {
+		c.Archive.SegmentSize = 1000
+	}
+	if !c.PostgresEnabled() && !c.ArchiveEnabled() {
+		return fmt.Errorf("at least one sink required: set database.url and/or archive.path (with archive.enabled)")
 	}
 	if c.Sync.PollInterval <= 0 {
 		c.Sync.PollInterval = 100 * time.Millisecond

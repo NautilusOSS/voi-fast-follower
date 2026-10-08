@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -40,7 +41,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fetch-only", "fetch-only | e2e | sweep | sink-compare | workers")
+	mode := flag.String("mode", "fetch-only", "fetch-only | e2e | sweep | sink-compare | pipelines | workers")
 	start := flag.Uint64("start", 0, "start round (0 = tip-count)")
 	count := flag.Uint64("count", 1000, "number of rounds to process")
 	workers := flag.Int("workers", 32, "concurrent fetch workers")
@@ -49,6 +50,8 @@ func main() {
 	flush := flag.Duration("flush", 200*time.Millisecond, "commit flush interval")
 	insertMode := flag.String("insert-mode", envOr("PG_INSERT_MODE", "unnest"), "postgres insert mode: unnest | copy")
 	asyncCommit := flag.Bool("async-commit", false, "experimental: SET LOCAL synchronous_commit=off")
+	pipeline := flag.String("pipeline", "postgres", "e2e pipeline: postgres | archive | both")
+	archivePath := flag.String("archive", envOr("ARCHIVE_PATH", ""), "archive root (archive/both pipelines)")
 	algodURL := flag.String("algod", envOr("VOI_ALGOD_URL", "https://mainnet-api.voi.nodely.dev"), "algod URL")
 	token := flag.String("token", envOr("VOI_ALGOD_TOKEN", ""), "algod token")
 	dsn := flag.String("database", envOr("DATABASE_URL", "postgres://follower:follower@localhost:5432/voi_follower?sslmode=disable"), "postgres DSN (e2e)")
@@ -92,6 +95,7 @@ func main() {
 	fmt.Printf("rounds:    %d\n", rounds)
 	fmt.Printf("workers:   %d\n", *workers)
 	fmt.Printf("insert:    %s\n", *insertMode)
+	fmt.Printf("pipeline:  %s\n", *pipeline)
 	fmt.Printf("async_cmt: %v\n", *asyncCommit)
 	fmt.Printf("tip:       %d\n", tip)
 	fmt.Printf("go:        %s/%s\n\n", runtime.GOOS, runtime.GOARCH)
@@ -112,12 +116,68 @@ func main() {
 				win = *batch
 			}
 		}
-		elapsed, stats, phase, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, *batch, *flush, *insertMode, *asyncCommit, *reset)
+		arch := *archivePath
+		if arch == "" && (*pipeline == "archive" || *pipeline == "both") {
+			arch = os.TempDir() + "/voi-ff-bench-archive"
+		}
+		elapsed, stats, phase, err := benchE2E(ctx, client, log, e2eOpts{
+			dsn: *dsn, migrations: *migrations, archive: arch, pipeline: *pipeline,
+			from: startRound, to: endRound, workers: *workers, window: win, batch: *batch,
+			flush: *flush, insertMode: *insertMode, asyncCommit: *asyncCommit, reset: *reset,
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "e2e failed: %v\n", err)
 			os.Exit(1)
 		}
-		printE2EResult(startRound, endRound, rounds, *batch, *insertMode, elapsed, stats, phase)
+		printE2EResult(startRound, endRound, rounds, *batch, *insertMode, *pipeline, elapsed, stats, phase)
+	case "pipelines":
+		win := *window
+		if win < 1 {
+			win = *workers * 2
+			if win < *batch {
+				win = *batch
+			}
+		}
+		fmt.Println("| Pipeline | Blocks | Elapsed | Blocks/sec | Avg Commit | p50 | p95 | Notes |")
+		fmt.Println("|---|---:|---:|---:|---:|---:|---:|---|")
+		{
+			elapsed, stats, errs, err := benchFetchOnly(ctx, client, startRound, endRound, *workers)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fetch-only: %v\n", err)
+				os.Exit(1)
+			}
+			bps := float64(rounds) / elapsed.Seconds()
+			avg, p50, p95 := stats.summary()
+			fmt.Printf("| Fetch only | %d | %s | %.2f | %s | %s | %s | errs=%d |\n",
+				rounds, elapsed.Round(time.Millisecond), bps,
+				avg.Round(time.Microsecond), p50.Round(time.Microsecond), p95.Round(time.Microsecond), errs)
+		}
+		for _, pipe := range []string{"postgres", "archive", "both"} {
+			arch := *archivePath
+			if arch == "" {
+				arch, _ = os.MkdirTemp("", "voi-ff-arch-"+pipe+"-*")
+			} else {
+				arch = filepath.Join(arch, pipe)
+				_ = os.RemoveAll(arch)
+			}
+			if pipe == "postgres" || pipe == "both" {
+				_ = truncateFollowerDB(ctx, *dsn, *migrations)
+			}
+			elapsed, stats, _, err := benchE2E(ctx, client, log, e2eOpts{
+				dsn: *dsn, migrations: *migrations, archive: arch, pipeline: pipe,
+				from: startRound, to: endRound, workers: *workers, window: win, batch: *batch,
+				flush: *flush, insertMode: *insertMode, asyncCommit: *asyncCommit, reset: true,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pipeline %s: %v\n", pipe, err)
+				os.Exit(1)
+			}
+			bps := float64(rounds) / elapsed.Seconds()
+			avg, p50, p95 := stats.summary()
+			fmt.Printf("| %s | %d | %s | %.2f | %s | %s | %s | batch=%d |\n",
+				pipe, rounds, elapsed.Round(time.Millisecond), bps,
+				avg.Round(time.Microsecond), p50.Round(time.Microsecond), p95.Round(time.Microsecond), *batch)
+		}
 	case "sweep":
 		batches := []int{10, 50, 100, 250, 500}
 		fmt.Println("| Endpoint | Mode | Batch | Blocks | Elapsed | Blocks/sec | Avg Commit | p50 | p95 |")
@@ -134,7 +194,11 @@ func main() {
 					win = b
 				}
 			}
-			elapsed, stats, _, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, b, *flush, *insertMode, *asyncCommit, true)
+			elapsed, stats, _, err := benchE2E(ctx, client, log, e2eOpts{
+				dsn: *dsn, migrations: *migrations, pipeline: "postgres",
+				from: startRound, to: endRound, workers: *workers, window: win, batch: b,
+				flush: *flush, insertMode: *insertMode, asyncCommit: *asyncCommit, reset: true,
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "sweep failed batch=%d: %v\n", b, err)
 				os.Exit(1)
@@ -174,7 +238,11 @@ func main() {
 				runtime.ReadMemStats(&ms)
 				heapBefore := ms.Alloc
 
-				elapsed, stats, phase, err := benchE2E(ctx, client, log, *dsn, *migrations, startRound, endRound, *workers, win, b, compareFlush, im, *asyncCommit, true)
+				elapsed, stats, phase, err := benchE2E(ctx, client, log, e2eOpts{
+					dsn: *dsn, migrations: *migrations, pipeline: "postgres",
+					from: startRound, to: endRound, workers: *workers, window: win, batch: b,
+					flush: compareFlush, insertMode: im, asyncCommit: *asyncCommit, reset: true,
+				})
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "sink-compare failed mode=%s batch=%d: %v\n", im, b, err)
 					os.Exit(1)
@@ -312,59 +380,96 @@ type phaseAgg struct {
 	n         int
 }
 
-func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, dsn, migrations string, from, to uint64, workers, window, batch int, flush time.Duration, insertMode string, asyncCommit, reset bool) (time.Duration, *latencyStats, phaseAgg, error) {
+type e2eOpts struct {
+	dsn, migrations, archive, pipeline string
+	from, to                           uint64
+	workers, window, batch             int
+	flush                              time.Duration
+	insertMode                         string
+	asyncCommit, reset                 bool
+}
+
+func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, o e2eOpts) (time.Duration, *latencyStats, phaseAgg, error) {
 	var phase phaseAgg
-	sink, err := storage.NewPostgres(ctx, dsn, migrations)
+	pgURL, archPath := "", ""
+	switch strings.ToLower(o.pipeline) {
+	case "", "postgres":
+		pgURL = o.dsn
+	case "archive":
+		archPath = o.archive
+		if archPath == "" {
+			return 0, nil, phase, fmt.Errorf("archive pipeline requires -archive path")
+		}
+		_ = os.RemoveAll(archPath)
+	case "both":
+		pgURL = o.dsn
+		archPath = o.archive
+		if archPath == "" {
+			return 0, nil, phase, fmt.Errorf("both pipeline requires -archive path")
+		}
+		_ = os.RemoveAll(archPath)
+	default:
+		return 0, nil, phase, fmt.Errorf("unknown pipeline %q", o.pipeline)
+	}
+
+	bundle, err := storage.BuildSinks(ctx, storage.BuildOptions{
+		PostgresURL:        pgURL,
+		PostgresMigrations: o.migrations,
+		PostgresInsertMode: o.insertMode,
+		PostgresAsync:      o.asyncCommit,
+		ArchivePath:        archPath,
+	})
 	if err != nil {
 		return 0, nil, phase, err
 	}
-	defer sink.Close()
-	if err := sink.SetInsertMode(insertMode); err != nil {
-		return 0, nil, phase, err
-	}
-	sink.SetAsyncCommit(asyncCommit)
+	defer bundle.Close()
 
 	var writeSum, commitSum time.Duration
 	var phaseN int
-	sink.OnTimings(func(t storage.CommitPhaseTimings) {
-		writeSum += t.Writes
-		commitSum += t.Commit
-		phaseN++
-	})
+	if bundle.Postgres != nil {
+		bundle.Postgres.OnTimings(func(t storage.CommitPhaseTimings) {
+			writeSum += t.Writes
+			commitSum += t.Commit
+			phaseN++
+		})
+	}
 
-	if reset {
-		if _, err := sink.Pool().Exec(ctx, `DELETE FROM transactions WHERE round >= $1 AND round <= $2`, from, to); err != nil {
+	if o.reset && bundle.Postgres != nil {
+		sink := bundle.Postgres
+		if _, err := sink.Pool().Exec(ctx, `DELETE FROM transactions WHERE round >= $1 AND round <= $2`, o.from, o.to); err != nil {
 			return 0, nil, phase, err
 		}
-		if _, err := sink.Pool().Exec(ctx, `DELETE FROM blocks WHERE round >= $1 AND round <= $2`, from, to); err != nil {
+		if _, err := sink.Pool().Exec(ctx, `DELETE FROM blocks WHERE round >= $1 AND round <= $2`, o.from, o.to); err != nil {
 			return 0, nil, phase, err
 		}
 		if _, err := sink.Pool().Exec(ctx, `
 			INSERT INTO sync_state(key, value) VALUES ('last_processed_round', $1)
 			ON CONFLICT (key) DO UPDATE SET value = $1
-		`, int64(from-1)); err != nil {
+		`, int64(o.from-1)); err != nil {
 			return 0, nil, phase, err
 		}
 	}
 
 	stats := &latencyStats{}
-	timed := &timingSink{inner: sink, stats: stats}
+	timed := &timingSink{inner: bundle.Primary, stats: stats}
 
 	cfg := &config.Config{
 		Network: "voi-mainnet",
 		Sync: config.SyncConfig{
-			StartRound:          fmt.Sprintf("%d", from),
+			StartRound:          fmt.Sprintf("%d", o.from),
 			Mode:                "fast",
 			PollInterval:        50 * time.Millisecond,
-			Workers:             workers,
-			FetchWindow:         window,
-			CommitBatchSize:     batch,
-			CommitFlushInterval: flush,
+			Workers:             o.workers,
+			FetchWindow:         o.window,
+			CommitBatchSize:     o.batch,
+			CommitFlushInterval: o.flush,
 		},
+		Database: config.DatabaseConfig{URL: pgURL, InsertMode: o.insertMode},
+		Archive:  config.ArchiveConfig{Enabled: archPath != "", Path: archPath},
 	}
 
 	m := metrics.New()
-	engine := follower.New(cfg, client, timed, m, log).WithUntilRound(to)
+	engine := follower.New(cfg, client, timed, m, log).WithUntilRound(o.to)
 
 	start := time.Now()
 	err = engine.Run(ctx)
@@ -377,12 +482,12 @@ func benchE2E(ctx context.Context, client *voi.Client, log *slog.Logger, dsn, mi
 	if err != nil {
 		return elapsed, stats, phase, err
 	}
-	last, ok, err := sink.LastProcessedRound(ctx)
+	last, ok, err := bundle.Primary.LastProcessedRound(ctx)
 	if err != nil {
 		return elapsed, stats, phase, err
 	}
-	if !ok || last < to {
-		return elapsed, stats, phase, fmt.Errorf("checkpoint=%d ok=%v want >= %d", last, ok, to)
+	if !ok || last < o.to {
+		return elapsed, stats, phase, fmt.Errorf("checkpoint=%d ok=%v want >= %d", last, ok, o.to)
 	}
 	return elapsed, stats, phase, nil
 }
@@ -403,7 +508,7 @@ func printFetchResult(start, end, rounds uint64, workers int, elapsed time.Durat
 	fmt.Printf("errors:          %d\n", errs)
 }
 
-func printE2EResult(start, end, rounds uint64, batch int, insertMode string, elapsed time.Duration, stats *latencyStats, phase phaseAgg) {
+func printE2EResult(start, end, rounds uint64, batch int, insertMode, pipeline string, elapsed time.Duration, stats *latencyStats, phase phaseAgg) {
 	bps := float64(rounds) / elapsed.Seconds()
 	avg, p50, p95 := stats.summary()
 	fmt.Println("=== Results ===")
@@ -411,6 +516,7 @@ func printE2EResult(start, end, rounds uint64, batch int, insertMode string, ela
 	fmt.Printf("end_round:       %d\n", end)
 	fmt.Printf("rounds:          %d\n", rounds)
 	fmt.Printf("batch_size:      %d\n", batch)
+	fmt.Printf("pipeline:        %s\n", pipeline)
 	fmt.Printf("insert_mode:     %s\n", insertMode)
 	fmt.Printf("elapsed:         %s\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("blocks_per_sec:  %.2f\n", bps)
