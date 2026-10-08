@@ -10,6 +10,7 @@ import (
 
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/block"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/config"
+	"github.com/nicholasshellabarger/voi-fast-follower/internal/health"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/metrics"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
 )
@@ -37,11 +38,15 @@ type Engine struct {
 	src     BlockSource
 	sink    storage.BatchBlockSink
 	metrics *metrics.Metrics
+	health  *health.Tracker
 	log     *slog.Logger
 
 	// untilRound, when non-zero, stops the engine after that round is committed
 	// (used by benchmarks; production leaves this at 0 = follow forever).
 	untilRound uint64
+
+	// commitTimeout bounds a single CommitBatch during graceful shutdown.
+	commitTimeout time.Duration
 }
 
 // New creates a follower engine. src is typically *voi.Client.
@@ -52,8 +57,27 @@ func New(cfg *config.Config, src BlockSource, sink storage.BlockSink, m *metrics
 	if m == nil {
 		m = metrics.Default()
 	}
-	return &Engine{cfg: cfg, src: src, sink: storage.AsBatchSink(sink), metrics: m, log: log}
+	return &Engine{
+		cfg:           cfg,
+		src:           src,
+		sink:          storage.AsBatchSink(sink),
+		metrics:       m,
+		health:        health.New(),
+		log:           log,
+		commitTimeout: 30 * time.Second,
+	}
 }
+
+// WithHealth attaches an external health tracker (shared with HTTP handlers).
+func (e *Engine) WithHealth(h *health.Tracker) *Engine {
+	if h != nil {
+		e.health = h
+	}
+	return e
+}
+
+// Health returns the engine health tracker.
+func (e *Engine) Health() *health.Tracker { return e.health }
 
 // WithUntilRound configures a finite catch-up that exits after committing round.
 func (e *Engine) WithUntilRound(round uint64) *Engine {
@@ -209,10 +233,12 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 			lastProcessed = nextCommit - 1
 		}
 		e.metrics.SetRounds(nextCommit, tip, lastProcessed)
+		e.health.UpdateProgress(nextCommit, tip, lastProcessed, nextCommit > 0)
 		return nil
 	}
 
 	if err := refreshTip(); err != nil {
+		e.health.SetFailed(err.Error())
 		return fmt.Errorf("initial tip: %w", err)
 	}
 
@@ -252,13 +278,14 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 		updateInFlight()
 
 		start := time.Now()
-		if err := e.sink.CommitBatch(ctx, batch); err != nil {
+		if err := e.commitBatch(ctx, batch); err != nil {
 			// Put the whole batch back; checkpoint must not have advanced.
 			for _, blk := range batch {
 				pending[blk.Round] = blk
 			}
 			updateInFlight()
 			e.metrics.RecordError()
+			e.health.SetSinkError(err.Error())
 			e.log.Error("batch commit failed; will retry",
 				"from", batch[0].Round, "to", batch[len(batch)-1].Round, "err", err)
 			if sleepErr := sleep(ctx, 500*time.Millisecond); sleepErr != nil {
@@ -267,6 +294,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 			return nil
 		}
 		e.metrics.ObserveCommit(time.Since(start))
+		e.health.ClearSinkError()
 
 		final := batch[len(batch)-1]
 		prevHash = newPrev
@@ -277,6 +305,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 			e.metrics.RecordBlock()
 		}
 		e.metrics.SetRounds(nextCommit, tip, final.Round)
+		e.health.UpdateProgress(nextCommit, tip, final.Round, true)
 		updateInFlight()
 		e.log.Debug("committed batch",
 			"from", batch[0].Round,
@@ -331,6 +360,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 
 	for {
 		if err := ctx.Err(); err != nil {
+			e.drainOnShutdown(pending, &nextCommit, &prevHash, &havePrev, &inFlight, tip, updateInFlight)
 			return err
 		}
 
@@ -385,6 +415,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 		if canDispatch {
 			select {
 			case <-ctx.Done():
+				e.drainOnShutdown(pending, &nextCommit, &prevHash, &havePrev, &inFlight, tip, updateInFlight)
 				return ctx.Err()
 			case jobs <- nextFetch:
 				nextFetch++
@@ -409,6 +440,7 @@ func (e *Engine) loop(ctx context.Context, nextCommit uint64) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			e.drainOnShutdown(pending, &nextCommit, &prevHash, &havePrev, &inFlight, tip, updateInFlight)
 			return ctx.Err()
 		case res := <-results:
 			timer.Stop()
@@ -508,6 +540,61 @@ func (e *Engine) shouldFlush(
 		}
 	}
 	return false
+}
+
+// commitBatch persists a batch with a timeout detached from fetch cancellation so
+// an in-flight durable commit can finish during graceful shutdown.
+func (e *Engine) commitBatch(ctx context.Context, batch []block.Block) error {
+	timeout := e.commitTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	return e.sink.CommitBatch(cctx, batch)
+}
+
+// drainOnShutdown stops dispatching and attempts one best-effort flush of already
+// buffered contiguous rounds. Incomplete work is not forced; checkpoint only moves
+// for successfully committed batches.
+func (e *Engine) drainOnShutdown(
+	pending map[uint64]block.Block,
+	nextCommit *uint64,
+	prevHash *string,
+	havePrev *bool,
+	inFlight *int,
+	tip uint64,
+	updateInFlight func(),
+) {
+	e.log.Info("shutdown: draining ordered buffer", "pending", len(pending), "inflight", *inFlight)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(pending) > 0 {
+		batch, newPrev, err := e.collectBatch(pending, *nextCommit, *prevHash, *havePrev, true)
+		if err != nil || len(batch) == 0 {
+			break
+		}
+		for _, blk := range batch {
+			delete(pending, blk.Round)
+		}
+		if err := e.commitBatch(context.Background(), batch); err != nil {
+			for _, blk := range batch {
+				pending[blk.Round] = blk
+			}
+			e.log.Warn("shutdown: commit aborted; checkpoint unchanged",
+				"from", batch[0].Round, "err", err)
+			break
+		}
+		final := batch[len(batch)-1]
+		*prevHash = newPrev
+		*havePrev = true
+		*nextCommit = final.Round + 1
+		for range batch {
+			e.metrics.RecordBlock()
+		}
+		e.metrics.SetRounds(*nextCommit, tip, final.Round)
+		e.health.UpdateProgress(*nextCommit, tip, final.Round, true)
+		updateInFlight()
+	}
 }
 
 func (e *Engine) fetchWorker(ctx context.Context, jobs <-chan uint64, results chan<- fetchResult) {

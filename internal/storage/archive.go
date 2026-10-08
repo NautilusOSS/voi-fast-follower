@@ -119,33 +119,35 @@ func (s *ArchiveSink) segmentStart(round uint64) uint64 {
 }
 
 func (s *ArchiveSink) loadCheckpoint() error {
-	b, err := os.ReadFile(s.checkpointPath())
+	cp, ok, err := readCheckpointFile(s.checkpointPath())
+	if err != nil {
+		return err
+	}
+	s.hasCP = ok
+	s.checkpoint = cp
+	return nil
+}
+
+func readCheckpointFile(path string) (uint64, bool, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.hasCP = false
-			s.checkpoint = 0
-			return nil
+			return 0, false, nil
 		}
-		return fmt.Errorf("read checkpoint: %w", err)
+		return 0, false, fmt.Errorf("read checkpoint: %w", err)
 	}
 	b = []byte(strings.TrimSpace(string(b)))
 	if len(b) == 0 {
-		s.hasCP = false
-		return nil
+		return 0, false, nil
 	}
-	// Prefer decimal text for inspectability; also accept 8-byte LE.
 	if len(b) == 8 {
-		s.checkpoint = binary.LittleEndian.Uint64(b)
-		s.hasCP = true
-		return nil
+		return binary.LittleEndian.Uint64(b), true, nil
 	}
 	n, err := strconv.ParseUint(string(b), 10, 64)
 	if err != nil {
-		return fmt.Errorf("parse checkpoint: %w", err)
+		return 0, false, fmt.Errorf("parse checkpoint: %w", err)
 	}
-	s.checkpoint = n
-	s.hasCP = true
-	return nil
+	return n, true, nil
 }
 
 func (s *ArchiveSink) writeCheckpoint(round uint64) error {

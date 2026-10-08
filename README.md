@@ -1,10 +1,21 @@
 # Voi Fast Follower
 
-Proof-of-concept **block ingestion primitive** for the Voi network. It sits between a Voi algod endpoint and downstream consumers (Conduit, indexers, analytics) and focuses on one job:
+**A high-throughput, gap-free, raw Voi block delivery layer.**
 
-> Provide reliable Voi blocks quickly, starting from a recent round—not from genesis.
+It sits between a Voi algod endpoint and downstream consumers and does one job well:
 
-This is **not** an indexer. Raw blocks/transactions are persisted; application decoding (ARC-200, DEX events, etc.) belongs downstream.
+> Acquire, validate, and deliver contiguous raw blocks quickly—starting from a recent round, not genesis.
+
+See the [stream contract](docs/stream-contract.md) for ordering, at-least-once delivery, restart, and failure guarantees.
+
+### What it is / is not
+
+| Is | Is not |
+|---|---|
+| Ordered raw block stream | An indexer |
+| Durable Postgres + local archive sinks | A DEX / ARC-200 / ARC-72 processor |
+| Offline archive replay | A Conduit fork |
+| Bounded, backpressured catch-up + live follow | Exactly-once messaging |
 
 ```text
 Voi Network (algod)
@@ -28,7 +39,28 @@ Voi Network (algod)
          (min across required sinks)
 ```
 
-## Features (Phase 1)
+## Guarantees (summary)
+
+Full text: [docs/stream-contract.md](docs/stream-contract.md) · Phase 6: [docs/phase6-stream-contract.md](docs/phase6-stream-contract.md)
+
+- **Order:** strict round order; no `N+2` before `N+1`
+- **Continuity:** gaps are errors
+- **Delivery:** at-least-once; effectively-once with idempotent sinks (not exactly-once)
+- **Restart:** `resume = checkpoint + 1`
+- **Failure:** sink error blocks checkpoint advance past the failed batch
+
+### Integrate as a consumer
+
+Implement `storage.BlockSink` / `BatchBlockSink` and attach via `BuildSinks` or `MultiSink`. Do not depend on fetch workers or buffer internals.
+
+```bash
+go run ./cmd/verify -archive ./archive
+go run ./cmd/archive-info -archive ./archive
+curl -s localhost:9090/healthz | jq .
+curl -s localhost:9090/readyz | jq .
+```
+
+## Features
 
 - Configurable algod URL/token (no hard-coded endpoints; no node internals)
 - `GetBlock` / `WaitForBlockAfter` over standard algod v2 msgpack `BlockRaw`
@@ -41,8 +73,10 @@ Voi Network (algod)
 - Durable checkpoint advanced only after all required sinks accept the batch
 - Idempotent writes; archive crash reconcile via checkpoint file
 - Offline **replay** from archive → any sink (`cmd/replay`)
+- Archive **verify** / **archive-info** tools (no network)
+- Concurrent MultiSink with min-checkpoint semantics
 - Live follow via `wait-for-block-after` using the same commit path
-- Prometheus metrics on `:9090/metrics`
+- `/healthz` + `/readyz` operational modes; Prometheus metrics on `:9090/metrics`
 - Docker Compose: `follower` + `postgres` (+ optional archive volume)
 
 ### Correctness invariant
@@ -223,15 +257,18 @@ Follower unit tests cover sequential ingestion, out-of-order fetch, ordered comm
 ```text
 cmd/follower/main.go
 cmd/bench/main.go
-cmd/replay/main.go     # archive → sink (offline)
+cmd/replay/main.go        # archive → sink (offline)
+cmd/verify/main.go        # archive integrity
+cmd/archive-info/main.go  # archive metadata
 internal/config/
-internal/voi/          # GetBlock, WaitForBlockAfter
-internal/block/        # canonical Block + msgpack decode
-internal/follower/     # worker pool + ordered stream
-internal/storage/      # BlockSink, Postgres, Archive, MultiSink
+internal/voi/             # GetBlock, WaitForBlockAfter
+internal/block/           # canonical Block + msgpack decode
+internal/follower/        # worker pool + ordered stream
+internal/storage/         # BlockSink, Postgres, Archive, MultiSink
+internal/health/          # /healthz /readyz state
 internal/metrics/
 migrations/
-scripts/bench.sh
+docs/stream-contract.md
 scripts/phase5-pipelines.sh
 ```
 

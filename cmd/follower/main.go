@@ -15,6 +15,7 @@ import (
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/api"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/config"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/follower"
+	"github.com/nicholasshellabarger/voi-fast-follower/internal/health"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/metrics"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/storage"
 	"github.com/nicholasshellabarger/voi-fast-follower/internal/voi"
@@ -65,23 +66,26 @@ func main() {
 		log.Error("sink setup error", "err", err)
 		os.Exit(1)
 	}
-	defer bundle.Close()
+	defer func() { _ = bundle.Close() }()
 	if cfg.Database.AsyncCommit {
 		log.Warn("experimental PG async commit enabled; durability is reduced")
 	}
 	log.Info("sinks ready", "sinks", strings.Join(bundle.Names, "+"))
 
 	m := metrics.Default()
+	ht := health.New()
 	if bundle.Archive != nil {
 		bundle.Archive.OnBytes(func(n int) { m.RecordArchiveBytes(n) })
+	}
+	if bundle.Multi != nil {
+		bundle.Multi.OnCommit(func(name string, d time.Duration, err error) {
+			m.ObserveSinkCommit(name, d, err)
+		})
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	ht.RegisterHandlers(mux)
 
 	if bundle.Postgres != nil {
 		apiServer := &api.Server{DB: bundle.Postgres, Voi: client}
@@ -97,23 +101,25 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Info("http listening", "addr", cfg.Metrics.Addr)
+		log.Info("http listening", "addr", cfg.Metrics.Addr, "healthz", "/healthz", "readyz", "/readyz")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http server error", "err", err)
 		}
 	}()
 
-	engine := follower.New(cfg, client, bundle.Primary, m, log)
+	engine := follower.New(cfg, client, bundle.Primary, m, log).WithHealth(ht)
 	err = engine.Run(ctx)
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 
 	if err != nil && err != context.Canceled {
+		ht.SetFailed(err.Error())
 		log.Error("follower stopped with error", "err", err)
 		os.Exit(1)
 	}
-	log.Info("follower stopped")
+	log.Info("follower stopped cleanly", "health", ht.Snapshot().Mode)
 }
 
 func mountExplorer(mux *http.ServeMux, webPath string, log *slog.Logger) {

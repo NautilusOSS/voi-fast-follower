@@ -40,6 +40,8 @@ type Metrics struct {
 	AwaitingCommit     prometheus.Gauge
 	ArchiveBytes       prometheus.Counter
 	ArchiveErrors      prometheus.Counter
+	SinkCommitLatency  *prometheus.HistogramVec
+	SinkErrors         *prometheus.CounterVec
 
 	processed     atomic.Uint64
 	fetched       atomic.Uint64
@@ -150,6 +152,15 @@ func New() *Metrics {
 			Name: "voi_follower_archive_errors_total",
 			Help: "Archive sink errors",
 		}),
+		SinkCommitLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "voi_follower_sink_commit_latency_seconds",
+			Help:    "Per-sink CommitBatch latency",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+		}, []string{"sink"}),
+		SinkErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "voi_follower_sink_errors_total",
+			Help: "Per-sink commit errors",
+		}, []string{"sink"}),
 	}
 	reg.MustRegister(
 		m.CurrentRound,
@@ -172,6 +183,8 @@ func New() *Metrics {
 		m.AwaitingCommit,
 		m.ArchiveBytes,
 		m.ArchiveErrors,
+		m.SinkCommitLatency,
+		m.SinkErrors,
 	)
 	now := time.Now().UnixNano()
 	m.windowStart.Store(now)
@@ -286,6 +299,17 @@ func (m *Metrics) RecordArchiveBytes(n int) {
 // RecordArchiveError increments archive error counter.
 func (m *Metrics) RecordArchiveError() {
 	m.ArchiveErrors.Inc()
+}
+
+// ObserveSinkCommit records per-sink commit latency and errors.
+func (m *Metrics) ObserveSinkCommit(sink string, d time.Duration, err error) {
+	m.SinkCommitLatency.WithLabelValues(sink).Observe(d.Seconds())
+	if err != nil {
+		m.SinkErrors.WithLabelValues(sink).Inc()
+		if sink == "archive" {
+			m.ArchiveErrors.Inc()
+		}
+	}
 }
 
 // ProcessedTotal returns the number of blocks recorded in-process.

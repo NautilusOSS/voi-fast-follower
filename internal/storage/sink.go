@@ -9,13 +9,12 @@ import (
 
 // BlockSink is the persistence/delivery abstraction for the canonical Block stream.
 //
-// Synchronization (fetch/order/validation) stays in the follower. Sinks only
-// persist or forward already-validated contiguous blocks. Postgres and the
-// local archive are first-party sinks; a future Conduit adapter can implement
-// the same interface.
+// Stream semantics (ordering, continuity, at-least-once) are defined in
+// docs/stream-contract.md. The follower owns acquisition/ordering/validation/
+// backpressure. Sinks own persistence, durability, and idempotency.
 //
-// Implementations MUST tolerate at-least-once delivery (idempotent writes).
-// Commit MUST durably persist the block data and advance last_processed_round.
+// MaxBlockRound / BlockHash support restart linkage and recovery; adapters that
+// cannot answer them should return ok=false.
 type BlockSink interface {
 	// Commit persists blk and advances the checkpoint to blk.Round.
 	// It must be safe to call again with the same round (idempotent).
