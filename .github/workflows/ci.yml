@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Race (core packages)
+        run: go test ./internal/follower ./internal/storage ./internal/stream ./internal/health ./internal/config -race -count=1
+
+      - name: Build commands
+        run: |
+          mkdir -p bin
+          go build -o bin/follower ./cmd/follower
+          go build -o /dev/null ./cmd/replay ./cmd/verify ./cmd/archive-info \
+            ./cmd/archive-export ./cmd/archive-import ./cmd/archive-compare \
+            ./cmd/archive-prune ./cmd/bootstrap ./cmd/bench
+
+      - name: Build Conduit plugin (optional module)
+        working-directory: plugins/conduit
+        run: |
+          go mod tidy
+          go test ./... -count=1
+          go build -o ../../bin/conduit ./cmd/conduit
+
+      - name: Docker build
+        run: docker build -t voi-fast-follower:ci .
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          POSTGRES_PASSWORD=ci VOI_ALGOD_URL=http://example:8080 \
+            docker compose -f docker-compose.prod.yml config >/dev/null

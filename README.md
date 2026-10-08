@@ -107,8 +107,24 @@ docker compose up --build
 | `ARCHIVE_SEGMENT_SIZE` | Rounds per `.seg` (default 1000) |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `METRICS_ADDR` | Metrics listen address (default `:9090`) |
+| `SHUTDOWN_TIMEOUT` | Graceful HTTP shutdown (default `10s`) |
 
-See [config.example.yaml](config.example.yaml). Legacy `PREFETCH_WORKERS` / `PREFETCH_BUFFER` env vars still work.
+See [config.example.yaml](config.example.yaml). Full production table: [docs/phase9-production.md](docs/phase9-production.md). Legacy `PREFETCH_WORKERS` / `PREFETCH_BUFFER` still work.
+
+### Running in production
+
+```bash
+cp .env.example .env   # set POSTGRES_PASSWORD, VOI_ALGOD_URL, token
+docker compose -f docker-compose.prod.yml up --build -d
+
+curl -s http://127.0.0.1:9090/readyz | jq .
+./scripts/phase9-backup-restore.sh backup
+./scripts/phase9-failure-inject.sh   # optional chaos checks
+```
+
+Production defaults keep Postgres durable (`PG_ASYNC_COMMIT=false`), live batch size 1, bounded fetch window, and archive fsync on. **Back up the archive** for historical blocks; consumers can restart/replay without reacquiring Voi.
+
+See [docs/phase9-production.md](docs/phase9-production.md) for storage layout, alerts, upgrades, and security notes.
 
 ### Local binary
 
@@ -316,8 +332,12 @@ migrations/
 docs/stream-contract.md
 docs/phase7-conduit-adapter.md
 docs/phase8-bootstrap-history.md
+docs/phase9-production.md
+deploy/docker-entrypoint.sh
+docker-compose.prod.yml
 scripts/phase5-pipelines.sh
 scripts/phase7-demo.sh
+scripts/phase9-*.sh
 ```
 
 ## Research notes (Phase 1)

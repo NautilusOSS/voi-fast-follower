@@ -36,6 +36,18 @@ func main() {
 	algodURL := flag.String("algod", envOr("VOI_ALGOD_URL", ""), "algod URL for live handoff")
 	token := flag.String("token", envOr("VOI_ALGOD_TOKEN", ""), "algod token")
 	insertMode := flag.String("insert-mode", envOr("PG_INSERT_MODE", "unnest"), "postgres insert mode")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `bootstrap — archive history then live algod handoff into a sink
+
+usage:
+  go run ./cmd/bootstrap -archive DIR [-start N] [-end M] -sink postgres \
+    -database "$DATABASE_URL" -algod "$VOI_ALGOD_URL"
+
+Historical rounds are read only from the archive. Live starts at archive_tip+1.
+
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

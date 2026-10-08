@@ -1,0 +1,33 @@
+# Example production YAML (env vars still override).
+network: voi-mainnet
+
+node:
+  algod_url: http://127.0.0.1:4001
+  algod_token: ""
+
+sync:
+  start_round: latest
+  mode: fast
+  poll_interval: 100ms
+  workers: 32
+  fetch_window: 128
+  commit_batch_size: 10
+  commit_flush_interval: 200ms
+
+database:
+  url: postgres://follower:CHANGE_ME@127.0.0.1:5432/voi_follower?sslmode=require
+  insert_mode: unnest
+  async_commit: false
+
+archive:
+  enabled: true
+  path: /var/lib/voi-fast-follower/archive
+  segment_size: 1000
+
+metrics:
+  addr: "127.0.0.1:9090"
+
+log:
+  level: info
+
+shutdown_timeout: 10s

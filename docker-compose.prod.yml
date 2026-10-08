@@ -1,0 +1,88 @@
+# Reference production deployment (Phase 9).
+# Conduit is intentionally omitted — point a separate Conduit binary at the archive.
+#
+#   cp .env.example .env
+#   docker compose -f docker-compose.prod.yml up --build -d
+#
+# Storage:
+#   follower-data  → /var/lib/voi-fast-follower/archive
+#   postgres-data  → PostgreSQL
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-follower}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-voi_follower}
+    # Do not publish 5432 on the host in production; use an internal network.
+    expose:
+      - "5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - follower-net
+
+  follower:
+    # Linux hosts: uncomment if algod runs on the Docker host
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VOI_ALGOD_URL: ${VOI_ALGOD_URL:?set VOI_ALGOD_URL}
+      VOI_ALGOD_TOKEN: ${VOI_ALGOD_TOKEN:-}
+      VOI_START_ROUND: ${VOI_START_ROUND:-latest}
+      DATABASE_URL: postgres://${POSTGRES_USER:-follower}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voi_follower}?sslmode=disable
+      ARCHIVE_ENABLED: "true"
+      ARCHIVE_PATH: /var/lib/voi-fast-follower/archive
+      ARCHIVE_SEGMENT_SIZE: ${ARCHIVE_SEGMENT_SIZE:-1000}
+      WORKERS: ${WORKERS:-32}
+      FETCH_WINDOW: ${FETCH_WINDOW:-128}
+      COMMIT_BATCH_SIZE: ${COMMIT_BATCH_SIZE:-10}
+      COMMIT_FLUSH_INTERVAL: ${COMMIT_FLUSH_INTERVAL:-200ms}
+      PG_INSERT_MODE: ${PG_INSERT_MODE:-unnest}
+      PG_ASYNC_COMMIT: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      METRICS_ADDR: ":9090"
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      MIGRATIONS_PATH: /app/migrations
+    volumes:
+      - follower-data:/var/lib/voi-fast-follower/archive
+    ports:
+      # Bind metrics/health to localhost by default; override in .env if needed.
+      - "${METRICS_HOST_BIND:-127.0.0.1}:9090:9090"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:9090/healthz >/dev/null || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - follower-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
+  follower-data:
+
+networks:
+  follower-net:
+    driver: bridge

@@ -7,3 +7,8 @@
 .DS_Store
 /voi-fast-follower
 /follower
+/archive/
+/backups/
+/.bench-archive-*/
+/docs/baselines/soak-*.log
+/docs/baselines/regression-*.txt

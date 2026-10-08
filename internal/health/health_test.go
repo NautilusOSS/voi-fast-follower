@@ -24,15 +24,24 @@ func TestModesAndHandlers(t *testing.T) {
 	if tr.Snapshot().Mode != ModeDegraded {
 		t.Fatal(tr.Snapshot().Mode)
 	}
+	if tr.Ready() {
+		t.Fatal("degraded must not be ready")
+	}
+	mux := http.NewServeMux()
+	tr.RegisterHandlers(mux)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz degraded want 503 got %d", rr.Code)
+	}
+
 	tr.ClearSinkError()
 	tr.UpdateProgress(200, 200, 199, true)
 	if tr.Snapshot().Mode != ModeLive {
 		t.Fatal(tr.Snapshot().Mode)
 	}
 
-	mux := http.NewServeMux()
-	tr.RegisterHandlers(mux)
-	rr := httptest.NewRecorder()
+	rr = httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("readyz=%d", rr.Code)

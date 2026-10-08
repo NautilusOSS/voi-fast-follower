@@ -32,3 +32,6 @@ metrics:
 
 log:
   level: info
+
+# Graceful HTTP shutdown after SIGTERM (production-safe default 10s)
+shutdown_timeout: 10s

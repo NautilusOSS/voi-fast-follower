@@ -20,7 +20,13 @@ func main() {
 	end := flag.Uint64("end", 0, "end round")
 	flag.Parse()
 	if *out == "" || *start == 0 || *end == 0 || *end < *start {
-		fmt.Fprintf(os.Stderr, "usage: archive-export -archive DIR -out DEST -start N -end M\n")
+		fmt.Fprintf(os.Stderr, `archive-export — copy a durable round range into a new archive directory
+
+usage:
+  go run ./cmd/archive-export -archive DIR -out DEST -start N -end M
+
+DEST must be empty. Verifies the export after write.
+`)
 		os.Exit(2)
 	}
 	t0 := time.Now()

@@ -44,6 +44,8 @@ services:
       retries: 60
       start_period: 120s
 
+  # Dev stack. For production-oriented defaults (archive required, locked-down ports)
+  # use docker-compose.prod.yml — see docs/phase9-production.md.
   follower:
     build: .
     depends_on:
@@ -68,6 +70,7 @@ services:
       ARCHIVE_SEGMENT_SIZE: ${ARCHIVE_SEGMENT_SIZE:-1000}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       METRICS_ADDR: ":9090"
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       MIGRATIONS_PATH: /app/migrations
     volumes:
       - follower-archive:/data/archive

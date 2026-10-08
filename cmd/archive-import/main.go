@@ -18,7 +18,13 @@ func main() {
 	dest := flag.String("archive", "", "destination archive root (must be empty)")
 	flag.Parse()
 	if *in == "" || *dest == "" {
-		fmt.Fprintf(os.Stderr, "usage: archive-import -in SRC -archive DEST\n")
+		fmt.Fprintf(os.Stderr, `archive-import — verify a source archive and copy into an empty destination
+
+usage:
+  go run ./cmd/archive-import -in SRC -archive DEST
+
+Refuses to overwrite a non-empty DEST.
+`)
 		os.Exit(2)
 	}
 	t0 := time.Now()

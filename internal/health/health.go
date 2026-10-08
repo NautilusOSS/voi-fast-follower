@@ -114,10 +114,11 @@ func (t *Tracker) Snapshot() Snapshot {
 	return t.snap
 }
 
-// Ready reports whether the process is fit to receive traffic (not startup/failed).
+// Ready reports whether the process is fit to receive traffic.
+// Startup, failed, and degraded (active sink error) are not ready.
 func (t *Tracker) Ready() bool {
 	s := t.Snapshot()
-	return s.Mode == ModeLive || s.Mode == ModeCatchingUp || s.Mode == ModeDegraded
+	return s.Mode == ModeLive || s.Mode == ModeCatchingUp
 }
 
 // Live reports whether the follower is near tip without sink errors.

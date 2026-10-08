@@ -110,7 +110,11 @@ func main() {
 	engine := follower.New(cfg, client, bundle.Primary, m, log).WithHealth(ht)
 	err = engine.Run(ctx)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownTO := cfg.ShutdownTimeout
+	if shutdownTO <= 0 {
+		shutdownTO = 10 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTO)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 

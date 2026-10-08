@@ -21,6 +21,8 @@ type Config struct {
 	Archive  ArchiveConfig  `yaml:"archive"`
 	Metrics  MetricsConfig  `yaml:"metrics"`
 	Log      LogConfig      `yaml:"log"`
+	// ShutdownTimeout bounds graceful HTTP shutdown after SIGTERM (default 10s).
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
 type NodeConfig struct {
@@ -127,6 +129,7 @@ func defaults() *Config {
 		Log: LogConfig{
 			Level: "info",
 		},
+		ShutdownTimeout: 10 * time.Second,
 	}
 }
 
@@ -216,6 +219,11 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		cfg.Log.Level = v
 	}
+	if v := os.Getenv("SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.ShutdownTimeout = d
+		}
+	}
 }
 
 // PostgresEnabled reports whether the Postgres sink should be constructed.
@@ -284,6 +292,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Log.Level) == "" {
 		c.Log.Level = "info"
+	}
+	if c.ShutdownTimeout <= 0 {
+		c.ShutdownTimeout = 10 * time.Second
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Database.InsertMode)) {
 	case "", "unnest":
