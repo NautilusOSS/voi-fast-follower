@@ -530,27 +530,115 @@ func (s *ArchiveSink) BlockHash(ctx context.Context, round uint64) (string, bool
 	return rec.Hash, true, nil
 }
 
+// GetBlock returns the canonical block for a durable archive round.
+// Rounds past the checkpoint are not available (ok=false, err=nil).
+func (s *ArchiveSink) GetBlock(ctx context.Context, round uint64) (block.Block, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasCP || round > s.checkpoint {
+		return block.Block{}, false, nil
+	}
+	rec, err := s.readRoundLocked(round)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) {
+			return block.Block{}, false, nil
+		}
+		return block.Block{}, false, err
+	}
+	blk := block.Block{
+		Round:             rec.Round,
+		BlockHash:         rec.Hash,
+		PreviousBlockHash: rec.PrevHash,
+		Raw:               append([]byte(nil), rec.Raw...),
+	}
+	if decoded, err := block.DecodeRaw(rec.Raw); err == nil {
+		if decoded.Round != rec.Round {
+			return block.Block{}, false, fmt.Errorf("round mismatch stored=%d decoded=%d", rec.Round, decoded.Round)
+		}
+		if decoded.BlockHash != rec.Hash {
+			return block.Block{}, false, fmt.Errorf("hash mismatch round %d", rec.Round)
+		}
+		if decoded.PreviousBlockHash != rec.PrevHash {
+			return block.Block{}, false, fmt.Errorf("prev hash mismatch round %d", rec.Round)
+		}
+		blk = decoded
+	}
+	return blk, true, nil
+}
+
 func (s *ArchiveSink) readRoundLocked(round uint64) (archiveRecord, error) {
+	// Fast path: segment naming for this process's segmentSize.
 	path := s.segmentPath(s.segmentStart(round))
+	if rec, err := readRoundFromSegment(path, round); err == nil {
+		return rec, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) {
+		// Keep scanning on miss; only abort on unexpected I/O errors from an existing file.
+		if !errors.Is(err, errRoundNotInSegment) {
+			return archiveRecord{}, err
+		}
+	}
+
+	// Fallback: scan all segments. Needed when an archive is reopened with a
+	// different SegmentSize than it was written with (segmentSize is not yet
+	// persisted in archive metadata).
+	entries, err := os.ReadDir(s.segmentsDir())
+	if err != nil {
+		return archiveRecord{}, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".seg") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := filepath.Join(s.segmentsDir(), name)
+		if p == path {
+			continue // already tried
+		}
+		rec, err := readRoundFromSegment(p, round)
+		if err == nil {
+			return rec, nil
+		}
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, errRoundNotInSegment) {
+			continue
+		}
+		return archiveRecord{}, err
+	}
+	return archiveRecord{}, io.EOF
+}
+
+var errRoundNotInSegment = errors.New("round not in segment")
+
+func readRoundFromSegment(path string, round uint64) (archiveRecord, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return archiveRecord{}, err
 	}
 	defer f.Close()
-	if _, err := readSegmentHeader(f); err != nil {
+	start, err := readSegmentHeader(f)
+	if err != nil {
 		return archiveRecord{}, err
+	}
+	// If header start is after the round, this segment cannot contain it.
+	if start > round {
+		return archiveRecord{}, errRoundNotInSegment
 	}
 	off := int64(archiveHeaderSize)
 	for {
 		rec, n, err := readRecordAt(f, off)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return archiveRecord{}, errRoundNotInSegment
+			}
 			return archiveRecord{}, err
 		}
 		if rec.Round == round {
 			return rec, nil
 		}
 		if rec.Round > round {
-			return archiveRecord{}, io.EOF
+			return archiveRecord{}, errRoundNotInSegment
 		}
 		off += n
 	}

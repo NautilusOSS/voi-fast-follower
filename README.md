@@ -18,26 +18,26 @@ See the [stream contract](docs/stream-contract.md) for ordering, at-least-once d
 | Bounded, backpressured catch-up + live follow | Exactly-once messaging |
 
 ```text
-Voi Network (algod)
-        │
-        ▼
- concurrent BlockRaw fetches  (worker pool)
-        │
-        ▼
- validation + ordered buffer  (gap-free)
-        │
-        ▼
- canonical Block stream       (raw msgpack preserved)
-        │
-        ├──────────────┬──────────────┐
-        ▼              ▼              ▼
-   PostgresSink   ArchiveSink    MultiSink
-        │              │              │
-        └──────────────┴──────────────┘
-                       ▼
-              durable checkpoint
-         (min across required sinks)
+              ┌──────────────┐
+              │   Voi node   │
+              └──────┬───────┘
+                     ↓
+             Voi Fast Follower
+                     ↓
+          ordered raw Block stream
+                     ↓
+          ┌──────────┴───────────┐
+          ↓                      ↓
+      PostgreSQL              Archive
+                                 ↓
+                              Replay / stream
+                                 ↓
+                         Conduit (optional)
 ```
+
+**Fast Follower handles synchronization. Conduit handles indexing/processing.**
+
+Conduit is an optional downstream consumer (`plugins/conduit`, importer `voi_archive`). Core follower builds do not require the Conduit module. See [docs/phase7-conduit-adapter.md](docs/phase7-conduit-adapter.md).
 
 ## Guarantees (summary)
 
@@ -159,6 +159,7 @@ See [migrations/001_initial.sql](migrations/001_initial.sql):
 | `voi_follower_workers_busy` / `_total` | Worker utilization |
 | `voi_follower_inflight_rounds` | Bounded window occupancy |
 | `voi_follower_errors_total` | Errors |
+| `conduit_*` (plugin binary) | Adapter delivery / lag — see phase 7 docs |
 
 ## Benchmark
 
@@ -228,6 +229,27 @@ go run ./cmd/replay -archive ./archive -start N -end M -sink postgres -database 
 COUNT=900 ./scripts/phase5-pipelines.sh
 ```
 
+### Phase 7 — Conduit consumer adapter
+
+See [docs/phase7-conduit-adapter.md](docs/phase7-conduit-adapter.md).
+
+```bash
+# Build custom Conduit binary (separate module; Conduit stays optional)
+cd plugins/conduit && go build -o ../../bin/conduit ./cmd/conduit
+./bin/conduit list   # includes voi_archive
+
+# Offline: archive → Conduit → file_writer (no Voi network)
+ARCHIVE_ONLY=1 ARCHIVE_PATH=./archive START=N END=M \
+  VOI_ALGOD_URL=http://127.0.0.1:4001 ./scripts/phase7-demo.sh
+
+# Or live: local Voi → follower archive → Conduit
+VOI_ALGOD_URL=http://127.0.0.1:4001 \
+VOI_ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  COUNT=20 ./scripts/phase7-demo.sh
+```
+
+Standalone paths still work without Conduit: Postgres, Archive, MultiSink, and archive replay.
+
 ```bash
 docker compose up -d postgres voi-node
 # After catchup (see docs/phase3-local-node.md):
@@ -241,6 +263,9 @@ COUNT=900 ./scripts/phase4-sink-compare.sh
 
 ```bash
 go test ./...
+
+# Conduit plugin module (optional dependency)
+cd plugins/conduit && go test ./...
 
 # Live algod decode check
 VOI_INTEGRATION=1 go test ./internal/block ./internal/voi -v
@@ -264,12 +289,17 @@ internal/config/
 internal/voi/             # GetBlock, WaitForBlockAfter
 internal/block/           # canonical Block + msgpack decode
 internal/follower/        # worker pool + ordered stream
+internal/stream/          # RoundSource / Cursor (consumer boundary)
+internal/conduit/         # translate + delivery (no Conduit module dep)
 internal/storage/         # BlockSink, Postgres, Archive, MultiSink
 internal/health/          # /healthz /readyz state
 internal/metrics/
+plugins/conduit/          # optional Conduit binary + voi_archive importer
 migrations/
 docs/stream-contract.md
+docs/phase7-conduit-adapter.md
 scripts/phase5-pipelines.sh
+scripts/phase7-demo.sh
 ```
 
 ## Research notes (Phase 1)
@@ -286,4 +316,4 @@ Genesis ID observed on mainnet API: `voimain-v1.0`.
 
 ## Non-goals (Phase 1)
 
-ARC-200/72 decoding, DEX/NFT indexing, explorer APIs, GraphQL, Supabase, Kafka, direct ledger DB access, BlockService RPC, Conduit integration, snapshot generation.
+ARC-200/72 decoding, DEX/NFT indexing, explorer APIs, GraphQL, Supabase, Kafka, direct ledger DB access, BlockService RPC, forking Conduit, making Conduit mandatory, snapshot generation, exactly-once delivery.

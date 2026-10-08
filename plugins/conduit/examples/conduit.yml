@@ -1,0 +1,32 @@
+# Example Conduit pipeline: Fast Follower archive → file_writer
+#
+# Prerequisites:
+#   1. Follower writing ARCHIVE_PATH (required sink)
+#   2. Network genesis.json copied next to this data dir
+#   3. Custom binary: cd plugins/conduit && go build -o ../../bin/conduit ./cmd/conduit
+#
+# Run:
+#   ./bin/conduit -d plugins/conduit/examples
+#
+# Checkpoint ownership:
+#   - Fast Follower archive checkpoint = sync durability
+#   - Conduit data-dir pipeline state = processing cursor
+#   - On restart Conduit resumes its own next round from the archive
+
+log-level: info
+
+importer:
+  name: voi_archive
+  config:
+    archive_path: "../../archive"
+    genesis_file: "genesis.json"
+    mode: follow
+    poll_interval: 200ms
+    wait_timeout: 0s
+
+processors:
+
+exporter:
+  name: file_writer
+  config:
+    # writes BlockData under the Conduit data directory
